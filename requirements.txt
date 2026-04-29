@@ -1,0 +1,5 @@
+fastapi==0.111.0
+uvicorn[standard]==0.29.0
+confluent-kafka==2.4.0
+redis[asyncio]==5.0.4
+websockets==12.0
