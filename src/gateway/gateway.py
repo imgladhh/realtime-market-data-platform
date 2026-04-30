@@ -10,6 +10,7 @@ from fastapi.responses import JSONResponse
 from src.engine.snapshot_store import SnapshotStore
 from src.engine.engine import DistributionEngine
 from src.gateway.session import ClientSession, SlowConsumerPolicy
+from src.gateway.aggregator import AggregationBuffer, AggregationMode
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -18,48 +19,52 @@ logger = logging.getLogger(__name__)
 
 snapshot_store = SnapshotStore()
 engine         = DistributionEngine()
+aggregator     = AggregationBuffer(mode=AggregationMode.RAW)
 
-# symbol -> set of ClientSession
 subscriptions: dict[str, set[ClientSession]] = {}
 subscriptions_lock = asyncio.Lock()
-
-# client_id -> ClientSession (for metrics)
 all_sessions: dict[str, ClientSession] = {}
+
+# Global dispatch stats
+_total_events_dispatched = 0
+_fanout_start_time = 0.0
 
 
 # ── Fanout loop ───────────────────────────────────────────────────────────────
 
 async def fanout_loop():
-    """
-    Core distribution loop.
+    global _total_events_dispatched, _fanout_start_time
 
-    For each incoming MarketEvent:
-      1. Update Redis snapshot
-      2. Look up subscribers for this symbol
-      3. Enqueue message into each ClientSession (non-blocking)
-
-    Slow clients are handled inside ClientSession.enqueue(),
-    so this loop is never blocked by a single slow client.
-    """
     loop = asyncio.get_running_loop()
     engine.consumer.start(loop)
+    aggregator.start()
+    _fanout_start_time = asyncio.get_event_loop().time()
     logger.info("Fanout loop started")
 
-    async for event in engine.consumer.events():
-        # 1. Update Redis snapshot
-        await snapshot_store.update(event)
+    async def _ingest():
+        """Feed Kafka events into aggregator."""
+        async for event in engine.consumer.events():
+            await snapshot_store.update(event)
+            await aggregator.push(event)
 
-        # 2. Get subscribers (non-blocking copy)
-        async with subscriptions_lock:
-            sessions = subscriptions.get(event.symbol, set()).copy()
+    async def _dispatch():
+        """Dispatch aggregated events to subscribers."""
+        global _total_events_dispatched
+        async for event in aggregator.events():
+            async with subscriptions_lock:
+                sessions = subscriptions.get(event.symbol, set()).copy()
 
-        if not sessions:
-            continue
+            if not sessions:
+                continue
 
-        # 3. Enqueue into each client's bounded queue (never blocks)
-        message = event.to_dict()
-        for session in sessions:
-            session.enqueue(message)
+            message = event.to_dict()
+            for session in sessions:
+                session.enqueue(message)
+
+            _total_events_dispatched += 1
+
+    # Run both concurrently
+    await asyncio.gather(_ingest(), _dispatch())
 
 
 # ── Lifespan ──────────────────────────────────────────────────────────────────
@@ -70,8 +75,10 @@ async def lifespan(app: FastAPI):
     logger.info("Gateway started")
     yield
     task.cancel()
+    aggregator.stop()
     engine.consumer.stop()
     await snapshot_store.close()
+    logger.info("Gateway shutdown")
 
 
 app = FastAPI(title="Market Data Gateway", lifespan=lifespan)
@@ -93,19 +100,54 @@ async def get_snapshot(symbol: str):
 
 @app.get("/metrics")
 async def get_metrics():
-    """Per-client stats: sent, dropped, uptime."""
+    """
+    System-wide and per-client metrics.
+    Key metrics for interview discussion:
+      - dispatch latency p50/p99 per client
+      - dropped and coalesced message counts
+      - global throughput (events/sec)
+    """
+    elapsed = asyncio.get_event_loop().time() - _fanout_start_time
+    throughput = round(_total_events_dispatched / max(elapsed, 1), 1)
+
     async with subscriptions_lock:
-        result = {
-            sid: {
-                "sent":     s.stats.sent,
-                "dropped":  s.stats.dropped,
-                "uptime_sec": round(s.stats.uptime_sec, 1),
-                "subscriptions": list(s.subscriptions),
-                "queue_size": s._queue.qsize(),
-            }
+        clients = {
+            sid: s.stats_dict()
             for sid, s in all_sessions.items()
         }
-    return {"clients": result, "total": len(result)}
+
+    return {
+        "system": {
+            "total_dispatched": _total_events_dispatched,
+            "uptime_sec":       round(elapsed, 1),
+            "throughput_eps":   throughput,   # events per second
+            "connected_clients": len(clients),
+            "aggregation_mode": aggregator.mode.value,
+        },
+        "clients": clients,
+    }
+
+
+@app.get("/metrics/summary")
+async def get_metrics_summary():
+    """Aggregated p50/p99 across all clients."""
+    async with subscriptions_lock:
+        sessions = list(all_sessions.values())
+
+    if not sessions:
+        return {"message": "no connected clients"}
+
+    all_p50 = [s.stats.latency.p50 for s in sessions if s.stats.latency.sample_count > 0]
+    all_p99 = [s.stats.latency.p99 for s in sessions if s.stats.latency.sample_count > 0]
+
+    return {
+        "clients":      len(sessions),
+        "avg_p50_ms":   round(sum(all_p50) / len(all_p50), 2) if all_p50 else 0,
+        "avg_p99_ms":   round(sum(all_p99) / len(all_p99), 2) if all_p99 else 0,
+        "total_sent":   sum(s.stats.sent for s in sessions),
+        "total_dropped": sum(s.stats.dropped for s in sessions),
+        "total_coalesced": sum(s.stats.coalesced for s in sessions),
+    }
 
 
 # ── WebSocket endpoint ────────────────────────────────────────────────────────
@@ -114,22 +156,28 @@ async def get_metrics():
 async def websocket_stream(websocket: WebSocket):
     await websocket.accept()
     client_id = str(uuid.uuid4())[:8]
+
+    # Client can request aggregated mode via query param:
+    # ws://localhost:8000/stream?mode=agg_100ms
+    mode_param = websocket.query_params.get("mode", "raw")
+    coalescing = mode_param != "raw"
+
     session = ClientSession(
         client_id=client_id,
         websocket=websocket,
         policy=SlowConsumerPolicy.DROP_OLDEST,
+        coalescing=coalescing,
     )
 
     async with subscriptions_lock:
         all_sessions[client_id] = session
 
     session.start_writer()
-    logger.info(f"[{client_id}] Client connected")
+    logger.info(f"[{client_id}] Connected (mode={mode_param})")
 
     try:
         while True:
-            # Wait for either a client message or disconnect signal
-            receive_task   = asyncio.create_task(websocket.receive_text())
+            receive_task    = asyncio.create_task(websocket.receive_text())
             disconnect_task = asyncio.create_task(session.wait_until_disconnected())
 
             done, pending = await asyncio.wait(
@@ -141,7 +189,6 @@ async def websocket_stream(websocket: WebSocket):
                 t.cancel()
 
             if disconnect_task in done:
-                # Slow consumer triggered disconnect
                 break
 
             if receive_task in done:
@@ -165,35 +212,25 @@ async def websocket_stream(websocket: WebSocket):
 
                 if action == "subscribe":
                     await _subscribe(session, symbol)
-
                 elif action == "unsubscribe":
                     await _unsubscribe(session, symbol)
-
                 else:
                     session.enqueue({"error": f"unknown action: {action}"})
 
     except WebSocketDisconnect:
-        logger.info(f"[{client_id}] Client disconnected")
+        logger.info(f"[{client_id}] Disconnected")
     finally:
         await _cleanup(session)
 
 
 async def _subscribe(session: ClientSession, symbol: str):
-    """
-    Subscribe flow:
-      1. Register in subscriptions registry
-      2. Send current snapshot (with seq=N)
-      3. Client will receive only seq > N going forward
-    """
     async with subscriptions_lock:
         subscriptions.setdefault(symbol, set()).add(session)
     session.subscriptions.add(symbol)
 
-    # Send snapshot immediately so client has current state + seq
     snapshot = await snapshot_store.get(symbol)
     if snapshot:
         session.enqueue({"type": "snapshot", **snapshot.to_dict()})
-        # Seed last_seq so gap detection works from here
         session.last_seq[symbol] = snapshot.seq
 
     logger.info(f"[{session.client_id}] Subscribed to {symbol}")
@@ -208,7 +245,6 @@ async def _unsubscribe(session: ClientSession, symbol: str):
 
 
 async def _cleanup(session: ClientSession):
-    """Remove session from all registries on disconnect."""
     async with subscriptions_lock:
         for symbol in session.subscriptions:
             subscriptions.get(symbol, set()).discard(session)
