@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import uuid
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
@@ -8,135 +9,219 @@ from fastapi.responses import JSONResponse
 
 from src.engine.snapshot_store import SnapshotStore
 from src.engine.engine import DistributionEngine
-from src.models import MarketEvent
+from src.gateway.session import ClientSession, SlowConsumerPolicy
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Shared state
-snapshot_store = SnapshotStore()
-engine = DistributionEngine()
+# ── Shared state ──────────────────────────────────────────────────────────────
 
-# Registry: symbol -> set of WebSocket connections
-subscriptions: dict[str, set[WebSocket]] = {}
+snapshot_store = SnapshotStore()
+engine         = DistributionEngine()
+
+# symbol -> set of ClientSession
+subscriptions: dict[str, set[ClientSession]] = {}
 subscriptions_lock = asyncio.Lock()
 
+# client_id -> ClientSession (for metrics)
+all_sessions: dict[str, ClientSession] = {}
+
+
+# ── Fanout loop ───────────────────────────────────────────────────────────────
 
 async def fanout_loop():
-    """Read events from engine and push to subscribed WebSocket clients."""
+    """
+    Core distribution loop.
+
+    For each incoming MarketEvent:
+      1. Update Redis snapshot
+      2. Look up subscribers for this symbol
+      3. Enqueue message into each ClientSession (non-blocking)
+
+    Slow clients are handled inside ClientSession.enqueue(),
+    so this loop is never blocked by a single slow client.
+    """
     loop = asyncio.get_running_loop()
     engine.consumer.start(loop)
+    logger.info("Fanout loop started")
 
     async for event in engine.consumer.events():
-        # Update Redis snapshot
+        # 1. Update Redis snapshot
         await snapshot_store.update(event)
 
-        # Fanout to subscribed clients
+        # 2. Get subscribers (non-blocking copy)
         async with subscriptions_lock:
-            clients = subscriptions.get(event.symbol, set()).copy()
+            sessions = subscriptions.get(event.symbol, set()).copy()
 
-        if not clients:
+        if not sessions:
             continue
 
-        message = json.dumps(event.to_dict())
-        dead = set()
-        for ws in clients:
-            try:
-                await ws.send_text(message)
-            except Exception:
-                dead.add(ws)
+        # 3. Enqueue into each client's bounded queue (never blocks)
+        message = event.to_dict()
+        for session in sessions:
+            session.enqueue(message)
 
-        # Clean up disconnected clients
-        if dead:
-            async with subscriptions_lock:
-                subscriptions[event.symbol] -= dead
 
+# ── Lifespan ──────────────────────────────────────────────────────────────────
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Start fanout loop on startup
     task = asyncio.create_task(fanout_loop())
-    logger.info("Gateway started, fanout loop running")
+    logger.info("Gateway started")
     yield
-    # Shutdown
     task.cancel()
     engine.consumer.stop()
     await snapshot_store.close()
-    logger.info("Gateway shutdown complete")
 
 
 app = FastAPI(title="Market Data Gateway", lifespan=lifespan)
 
 
-# ── REST: get current snapshot ────────────────────────────────────────────────
+# ── REST endpoints ────────────────────────────────────────────────────────────
 
 @app.get("/snapshot/{symbol}")
 async def get_snapshot(symbol: str):
     symbol = symbol.upper()
     data = await snapshot_store.get(symbol)
     if data is None:
-        return JSONResponse(status_code=404, content={"error": f"No snapshot for {symbol}"})
+        return JSONResponse(
+            status_code=404,
+            content={"error": f"No snapshot for {symbol}"}
+        )
     return data.to_dict()
 
 
-@app.get("/symbols")
-async def get_symbols():
-    return {"symbols": list(engine.consumer._config.get("symbols", [
-        "AAPL", "TSLA", "GOOGL", "MSFT", "BTCUSD"
-    ]))}
+@app.get("/metrics")
+async def get_metrics():
+    """Per-client stats: sent, dropped, uptime."""
+    async with subscriptions_lock:
+        result = {
+            sid: {
+                "sent":     s.stats.sent,
+                "dropped":  s.stats.dropped,
+                "uptime_sec": round(s.stats.uptime_sec, 1),
+                "subscriptions": list(s.subscriptions),
+                "queue_size": s._queue.qsize(),
+            }
+            for sid, s in all_sessions.items()
+        }
+    return {"clients": result, "total": len(result)}
 
 
-# ── WebSocket: subscribe to real-time updates ─────────────────────────────────
+# ── WebSocket endpoint ────────────────────────────────────────────────────────
 
 @app.websocket("/stream")
 async def websocket_stream(websocket: WebSocket):
     await websocket.accept()
-    client_symbols: set[str] = set()
-    logger.info("Client connected")
+    client_id = str(uuid.uuid4())[:8]
+    session = ClientSession(
+        client_id=client_id,
+        websocket=websocket,
+        policy=SlowConsumerPolicy.DROP_OLDEST,
+    )
+
+    async with subscriptions_lock:
+        all_sessions[client_id] = session
+
+    session.start_writer()
+    logger.info(f"[{client_id}] Client connected")
 
     try:
         while True:
-            raw = await websocket.receive_text()
-            msg = json.loads(raw)
-            action = msg.get("action")
-            symbol = msg.get("symbol", "").upper()
+            # Wait for either a client message or disconnect signal
+            receive_task   = asyncio.create_task(websocket.receive_text())
+            disconnect_task = asyncio.create_task(session.wait_until_disconnected())
 
-            if not symbol:
-                await websocket.send_text(json.dumps({"error": "symbol required"}))
-                continue
+            done, pending = await asyncio.wait(
+                [receive_task, disconnect_task],
+                return_when=asyncio.FIRST_COMPLETED,
+            )
 
-            if action == "subscribe":
-                async with subscriptions_lock:
-                    subscriptions.setdefault(symbol, set()).add(websocket)
-                client_symbols.add(symbol)
+            for t in pending:
+                t.cancel()
 
-                # Send current snapshot immediately on subscribe
-                snapshot = await snapshot_store.get(symbol)
-                if snapshot:
-                    await websocket.send_text(json.dumps({
-                        "type": "snapshot",
-                        **snapshot.to_dict()
-                    }))
-                logger.info(f"Client subscribed to {symbol}")
+            if disconnect_task in done:
+                # Slow consumer triggered disconnect
+                break
 
-            elif action == "unsubscribe":
-                async with subscriptions_lock:
-                    subscriptions.get(symbol, set()).discard(websocket)
-                client_symbols.discard(symbol)
-                logger.info(f"Client unsubscribed from {symbol}")
+            if receive_task in done:
+                try:
+                    raw = receive_task.result()
+                except Exception:
+                    break
 
-            else:
-                await websocket.send_text(json.dumps({"error": f"unknown action: {action}"}))
+                try:
+                    msg = json.loads(raw)
+                except json.JSONDecodeError:
+                    session.enqueue({"error": "invalid json"})
+                    continue
+
+                action = msg.get("action")
+                symbol = msg.get("symbol", "").upper()
+
+                if not symbol:
+                    session.enqueue({"error": "symbol required"})
+                    continue
+
+                if action == "subscribe":
+                    await _subscribe(session, symbol)
+
+                elif action == "unsubscribe":
+                    await _unsubscribe(session, symbol)
+
+                else:
+                    session.enqueue({"error": f"unknown action: {action}"})
 
     except WebSocketDisconnect:
-        logger.info("Client disconnected")
+        logger.info(f"[{client_id}] Client disconnected")
     finally:
-        # Clean up all subscriptions for this client
-        async with subscriptions_lock:
-            for symbol in client_symbols:
-                subscriptions.get(symbol, set()).discard(websocket)
+        await _cleanup(session)
+
+
+async def _subscribe(session: ClientSession, symbol: str):
+    """
+    Subscribe flow:
+      1. Register in subscriptions registry
+      2. Send current snapshot (with seq=N)
+      3. Client will receive only seq > N going forward
+    """
+    async with subscriptions_lock:
+        subscriptions.setdefault(symbol, set()).add(session)
+    session.subscriptions.add(symbol)
+
+    # Send snapshot immediately so client has current state + seq
+    snapshot = await snapshot_store.get(symbol)
+    if snapshot:
+        session.enqueue({"type": "snapshot", **snapshot.to_dict()})
+        # Seed last_seq so gap detection works from here
+        session.last_seq[symbol] = snapshot.seq
+
+    logger.info(f"[{session.client_id}] Subscribed to {symbol}")
+
+
+async def _unsubscribe(session: ClientSession, symbol: str):
+    async with subscriptions_lock:
+        subscriptions.get(symbol, set()).discard(session)
+    session.subscriptions.discard(symbol)
+    session.last_seq.pop(symbol, None)
+    logger.info(f"[{session.client_id}] Unsubscribed from {symbol}")
+
+
+async def _cleanup(session: ClientSession):
+    """Remove session from all registries on disconnect."""
+    async with subscriptions_lock:
+        for symbol in session.subscriptions:
+            subscriptions.get(symbol, set()).discard(session)
+        all_sessions.pop(session.client_id, None)
+    await session.close()
+    logger.info(f"[{session.client_id}] Cleaned up")
 
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("src.gateway.gateway:app", host="0.0.0.0", port=8000, reload=False)
+    uvicorn.run(
+        "src.gateway.gateway:app",
+        host="0.0.0.0",
+        port=8000,
+        reload=False,
+    )
