@@ -155,7 +155,6 @@ async def get_metrics_summary():
         "avg_p99_ms":      round(sum(all_p99) / len(all_p99), 2) if all_p99 else 0,
         "total_sent":      sum(s.stats.sent for s in sessions),
         "total_dropped":   sum(s.stats.dropped for s in sessions),
-        "total_coalesced": sum(s.stats.coalesced for s in sessions),
     }
 
 
@@ -177,7 +176,6 @@ async def websocket_stream(websocket: WebSocket):
         client_id=client_id,
         websocket=websocket,
         policy=SlowConsumerPolicy.DROP_OLDEST,
-        coalescing=(agg_mode == AggregationMode.RAW),
     )
 
     # Assign per-client aggregator and start it

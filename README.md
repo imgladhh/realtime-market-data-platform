@@ -463,7 +463,7 @@ pytest -v
 ```
 
 **Test coverage:**
-- `ClientSession`: drop_oldest policy, coalescing, gap detection, writer loop, latency tracking
+- `ClientSession`: drop_oldest policy, gap detection, writer loop, latency tracking
 - `AggregationBuffer`: RAW passthrough, AGG_100MS buffering, per-symbol latest-wins, flush lifecycle
 - `SnapshotStore`: Redis HSET calls, field serialization, TTL, missing key handling
 - `MarketEvent`: field preservation, type serialization, to_dict correctness
