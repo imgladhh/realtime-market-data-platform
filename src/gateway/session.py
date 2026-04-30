@@ -51,12 +51,11 @@ class LatencyTracker:
 
 @dataclass
 class ClientStats:
-    sent:         int = 0
-    dropped:      int = 0
-    coalesced:    int = 0
-    gaps_detected: int = 0          # how many seq gaps were detected
-    connected_at: float = field(default_factory=time.time)
-    latency:      LatencyTracker = field(default_factory=LatencyTracker)
+    sent:          int = 0
+    dropped:       int = 0
+    gaps_detected: int = 0
+    connected_at:  float = field(default_factory=time.time)
+    latency:       LatencyTracker = field(default_factory=LatencyTracker)
 
     @property
     def uptime_sec(self) -> float:
@@ -68,11 +67,21 @@ class ClientSession:
     Represents one connected WebSocket client.
 
     Owns:
-      - BoundedQueue: outbound message buffer
+      - BoundedQueue: outbound message buffer (maxsize=500)
       - WriterLoop: independent asyncio.Task draining the queue
-      - LatencyTracker: p50/p99 dispatch latency
+      - LatencyTracker: rolling p50/p99 dispatch latency
       - last_seq: per-symbol sequence tracking for gap detection
-      - aggregator: set by gateway after construction (RAW or AGG_100MS)
+      - aggregator: per-client AggregationBuffer (RAW or AGG_100MS)
+                    set by gateway after construction
+
+    Aggregation / coalescing is handled entirely by AggregationBuffer:
+      - RAW mode:      every tick delivered in order, gap detection enabled
+      - AGG_100MS mode: latest-per-symbol per 100ms window, gap detection disabled
+
+    ClientSession itself does NOT do coalescing — keeping message ordering
+    correct while coalescing in a single asyncio.Queue requires replacing
+    queue entries in-place, which asyncio.Queue does not support.
+    The AggregationBuffer layer handles this cleanly before enqueue.
     """
 
     def __init__(
@@ -80,24 +89,14 @@ class ClientSession:
         client_id: str,
         websocket: WebSocket,
         policy: SlowConsumerPolicy = SlowConsumerPolicy.DROP_OLDEST,
-        coalescing: bool = True,
     ):
         self.client_id     = client_id
         self.websocket     = websocket
         self.policy        = policy
-        self.coalescing    = coalescing
         self.subscriptions: set[str] = set()
         self.stats         = ClientStats()
-
-        # Per-symbol sequence tracking for gap detection
-        # Populated on subscribe (seeded from snapshot seq)
-        self.last_seq: dict[str, int] = {}
-
-        # Set by gateway after construction
-        self.aggregator = None
-
-        # Coalescing: symbol -> latest pending message not yet dequeued
-        self._pending: dict[str, dict] = {}
+        self.last_seq:     dict[str, int] = {}
+        self.aggregator    = None  # set by gateway after construction
 
         self._queue: asyncio.Queue[dict] = asyncio.Queue(maxsize=QUEUE_MAX_SIZE)
         self._writer_task: asyncio.Task | None = None
@@ -107,19 +106,14 @@ class ClientSession:
 
     def check_gap(self, symbol: str, seq: int) -> bool:
         """
-        Called on every event before enqueuing.
+        Returns True if a seq gap is detected (missed messages).
+        Tolerance of 5 accounts for minor reordering within a burst.
 
-        Returns True if a gap is detected (missed messages).
-        A gap means seq jumped by more than 5 from the last seen seq.
-        Tolerance of 5 accounts for reordering within a burst.
-
-        When a gap is detected, the caller (client_dispatch_loop in gateway)
-        is responsible for re-fetching the snapshot and reseeding last_seq.
+        Only called in RAW mode. In AGG_100MS mode, seq jumps are
+        expected (intermediate events are intentionally skipped).
         """
         last = self.last_seq.get(symbol)
         if last is None:
-            # First message after subscribe — no gap possible,
-            # last_seq was already seeded from snapshot in _subscribe()
             self.last_seq[symbol] = seq
             return False
 
@@ -137,23 +131,12 @@ class ClientSession:
 
     def enqueue(self, message: dict) -> bool:
         """
-        Non-blocking enqueue with optional coalescing.
+        Non-blocking enqueue into the bounded outbound queue.
 
-        Coalescing: if a message for this symbol is already pending
-        in the queue, replace it with the latest one.
+        If queue is full, SlowConsumerPolicy determines behavior:
+          DROP_OLDEST: discard oldest message, enqueue latest
+          DISCONNECT:  signal disconnect after threshold
         """
-        symbol = message.get("symbol")
-
-        if self.coalescing and symbol:
-            if symbol in self._pending:
-                self._pending[symbol] = message
-                self.stats.coalesced += 1
-                return True
-            self._pending[symbol] = message
-
-        return self._enqueue_raw(message)
-
-    def _enqueue_raw(self, message: dict) -> bool:
         try:
             self._queue.put_nowait(message)
             return True
@@ -195,12 +178,6 @@ class ClientSession:
                 except asyncio.TimeoutError:
                     continue
 
-                # Clear coalescing tracker
-                symbol = message.get("symbol")
-                if self.coalescing and symbol:
-                    self._pending.pop(symbol, None)
-
-                # Record dispatch latency
                 event_ts = message.get("event_ts")
                 if event_ts:
                     self.stats.latency.record(event_ts)
@@ -219,7 +196,7 @@ class ClientSession:
             logger.info(
                 f"[{self.client_id}] Writer stopped | "
                 f"sent={self.stats.sent} dropped={self.stats.dropped} "
-                f"coalesced={self.stats.coalesced} gaps={self.stats.gaps_detected} "
+                f"gaps={self.stats.gaps_detected} "
                 f"p50={self.stats.latency.p50}ms p99={self.stats.latency.p99}ms"
             )
 
@@ -250,7 +227,6 @@ class ClientSession:
         return {
             "sent":           self.stats.sent,
             "dropped":        self.stats.dropped,
-            "coalesced":      self.stats.coalesced,
             "gaps_detected":  self.stats.gaps_detected,
             "uptime_sec":     round(self.stats.uptime_sec, 1),
             "subscriptions":  list(self.subscriptions),
