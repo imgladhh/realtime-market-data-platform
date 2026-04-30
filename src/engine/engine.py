@@ -20,7 +20,7 @@ class KafkaConsumerBridge:
     def __init__(
         self,
         bootstrap_servers: str = "localhost:9092",
-        group_id: str = "market-data-engine",
+        group_id: str = "gateway-engine",
     ):
         self._config = {
             "bootstrap.servers": bootstrap_servers,

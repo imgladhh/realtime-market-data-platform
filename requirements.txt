@@ -4,3 +4,4 @@ confluent-kafka==2.4.0
 redis[asyncio]==5.0.4
 websockets==12.0
 msgpack==1.0.8
+aiohttp==3.13.5

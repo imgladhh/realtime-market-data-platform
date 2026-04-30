@@ -19,13 +19,11 @@ logger = logging.getLogger(__name__)
 
 snapshot_store = SnapshotStore()
 engine         = DistributionEngine()
-aggregator     = AggregationBuffer(mode=AggregationMode.RAW)
 
 subscriptions: dict[str, set[ClientSession]] = {}
 subscriptions_lock = asyncio.Lock()
 all_sessions: dict[str, ClientSession] = {}
 
-# Global dispatch stats
 _total_events_dispatched = 0
 _fanout_start_time = 0.0
 
@@ -37,34 +35,55 @@ async def fanout_loop():
 
     loop = asyncio.get_running_loop()
     engine.consumer.start(loop)
-    aggregator.start()
     _fanout_start_time = asyncio.get_event_loop().time()
     logger.info("Fanout loop started")
 
-    async def _ingest():
-        """Feed Kafka events into aggregator."""
-        async for event in engine.consumer.events():
-            await snapshot_store.update(event)
-            await aggregator.push(event)
+    async for event in engine.consumer.events():
+        # 1. Update Redis snapshot
+        await snapshot_store.update(event)
 
-    async def _dispatch():
-        """Dispatch aggregated events to subscribers."""
-        global _total_events_dispatched
-        async for event in aggregator.events():
-            async with subscriptions_lock:
-                sessions = subscriptions.get(event.symbol, set()).copy()
+        # 2. Get subscribers
+        async with subscriptions_lock:
+            sessions = subscriptions.get(event.symbol, set()).copy()
 
-            if not sessions:
-                continue
+        if not sessions:
+            continue
 
-            message = event.to_dict()
-            for session in sessions:
-                session.enqueue(message)
-
+        # 3. Push into each client's aggregation buffer
+        for session in sessions:
+            await session.aggregator.push(event)
             _total_events_dispatched += 1
 
-    # Run both concurrently
-    await asyncio.gather(_ingest(), _dispatch())
+
+async def client_dispatch_loop(session: ClientSession):
+    """
+    Per-client loop: reads from client's AggregationBuffer,
+    runs gap detection, then enqueues into BoundedQueue.
+
+    Gap detection is only meaningful in RAW mode.
+    In AGG_100MS mode, seq jumps are expected because aggregation
+    intentionally skips intermediate events.
+    """
+    is_raw = session.aggregator.mode == AggregationMode.RAW
+    logger.info(f"[{session.client_id}] Dispatch loop started (mode={session.aggregator.mode.value})")
+    try:
+        async for event in session.aggregator.events():
+            symbol = event.symbol
+
+            # Gap detection: RAW mode only
+            if is_raw and session.check_gap(symbol, event.seq):
+                snapshot = await snapshot_store.get(symbol)
+                if snapshot:
+                    session.enqueue({"type": "snapshot", **snapshot.to_dict()})
+                    session.last_seq[symbol] = snapshot.seq
+                continue
+
+            # Normal incremental delivery
+            session.enqueue(event.to_dict())
+
+    except asyncio.CancelledError:
+        pass
+    logger.info(f"[{session.client_id}] Dispatch loop stopped")
 
 
 # ── Lifespan ──────────────────────────────────────────────────────────────────
@@ -75,7 +94,6 @@ async def lifespan(app: FastAPI):
     logger.info("Gateway started")
     yield
     task.cancel()
-    aggregator.stop()
     engine.consumer.stop()
     await snapshot_store.close()
     logger.info("Gateway shutdown")
@@ -100,13 +118,6 @@ async def get_snapshot(symbol: str):
 
 @app.get("/metrics")
 async def get_metrics():
-    """
-    System-wide and per-client metrics.
-    Key metrics for interview discussion:
-      - dispatch latency p50/p99 per client
-      - dropped and coalesced message counts
-      - global throughput (events/sec)
-    """
     elapsed = asyncio.get_event_loop().time() - _fanout_start_time
     throughput = round(_total_events_dispatched / max(elapsed, 1), 1)
 
@@ -118,11 +129,10 @@ async def get_metrics():
 
     return {
         "system": {
-            "total_dispatched": _total_events_dispatched,
-            "uptime_sec":       round(elapsed, 1),
-            "throughput_eps":   throughput,   # events per second
+            "total_dispatched":  _total_events_dispatched,
+            "uptime_sec":        round(elapsed, 1),
+            "throughput_eps":    throughput,
             "connected_clients": len(clients),
-            "aggregation_mode": aggregator.mode.value,
         },
         "clients": clients,
     }
@@ -130,7 +140,6 @@ async def get_metrics():
 
 @app.get("/metrics/summary")
 async def get_metrics_summary():
-    """Aggregated p50/p99 across all clients."""
     async with subscriptions_lock:
         sessions = list(all_sessions.values())
 
@@ -141,11 +150,11 @@ async def get_metrics_summary():
     all_p99 = [s.stats.latency.p99 for s in sessions if s.stats.latency.sample_count > 0]
 
     return {
-        "clients":      len(sessions),
-        "avg_p50_ms":   round(sum(all_p50) / len(all_p50), 2) if all_p50 else 0,
-        "avg_p99_ms":   round(sum(all_p99) / len(all_p99), 2) if all_p99 else 0,
-        "total_sent":   sum(s.stats.sent for s in sessions),
-        "total_dropped": sum(s.stats.dropped for s in sessions),
+        "clients":         len(sessions),
+        "avg_p50_ms":      round(sum(all_p50) / len(all_p50), 2) if all_p50 else 0,
+        "avg_p99_ms":      round(sum(all_p99) / len(all_p99), 2) if all_p99 else 0,
+        "total_sent":      sum(s.stats.sent for s in sessions),
+        "total_dropped":   sum(s.stats.dropped for s in sessions),
         "total_coalesced": sum(s.stats.coalesced for s in sessions),
     }
 
@@ -157,22 +166,36 @@ async def websocket_stream(websocket: WebSocket):
     await websocket.accept()
     client_id = str(uuid.uuid4())[:8]
 
-    # Client can request aggregated mode via query param:
-    # ws://localhost:8000/stream?mode=agg_100ms
     mode_param = websocket.query_params.get("mode", "raw")
-    coalescing = mode_param != "raw"
+    agg_mode = (
+        AggregationMode.AGG_100MS
+        if mode_param == "agg_100ms"
+        else AggregationMode.RAW
+    )
 
     session = ClientSession(
         client_id=client_id,
         websocket=websocket,
         policy=SlowConsumerPolicy.DROP_OLDEST,
-        coalescing=coalescing,
+        coalescing=(agg_mode == AggregationMode.RAW),
     )
+
+    # Assign per-client aggregator and start it
+    session.aggregator = AggregationBuffer(mode=agg_mode)
+    session.aggregator.start()
 
     async with subscriptions_lock:
         all_sessions[client_id] = session
 
+    # Start writer loop (drains queue → WebSocket)
     session.start_writer()
+
+    # Start dispatch loop (aggregator → queue)
+    dispatch_task = asyncio.create_task(
+        client_dispatch_loop(session),
+        name=f"dispatch-{client_id}"
+    )
+
     logger.info(f"[{client_id}] Connected (mode={mode_param})")
 
     try:
@@ -220,20 +243,38 @@ async def websocket_stream(websocket: WebSocket):
     except WebSocketDisconnect:
         logger.info(f"[{client_id}] Disconnected")
     finally:
+        dispatch_task.cancel()
+        try:
+            await dispatch_task
+        except asyncio.CancelledError:
+            pass
+        session.aggregator.stop()
         await _cleanup(session)
 
 
 async def _subscribe(session: ClientSession, symbol: str):
+    """
+    Subscribe flow:
+    1. Register in SubscriptionRegistry so fanout_loop delivers events
+    2. Send current snapshot with seq=N (client context initialization)
+    3. Seed last_seq[symbol] = N for gap detection
+    After this, client_dispatch_loop delivers seq > N via aggregator
+    """
     async with subscriptions_lock:
         subscriptions.setdefault(symbol, set()).add(session)
     session.subscriptions.add(symbol)
 
     snapshot = await snapshot_store.get(symbol)
     if snapshot:
+        # Send snapshot directly to queue (not through aggregator)
         session.enqueue({"type": "snapshot", **snapshot.to_dict()})
         session.last_seq[symbol] = snapshot.seq
-
-    logger.info(f"[{session.client_id}] Subscribed to {symbol}")
+        logger.info(
+            f"[{session.client_id}] Subscribed to {symbol} "
+            f"seq_seed={snapshot.seq}"
+        )
+    else:
+        logger.info(f"[{session.client_id}] Subscribed to {symbol} (no snapshot yet)")
 
 
 async def _unsubscribe(session: ClientSession, symbol: str):
