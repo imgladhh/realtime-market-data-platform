@@ -16,6 +16,7 @@ from src.gateway.session import (
     SubscriptionFilter,
 )
 from src.gateway.aggregator import AggregationBuffer, AggregationMode
+from src.storage.history_store import DEFAULT_HISTORY_LIMIT, HistoryStore
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -23,6 +24,7 @@ logger = logging.getLogger(__name__)
 # ── Shared state ──────────────────────────────────────────────────────────────
 
 snapshot_store = SnapshotStore()
+history_store  = HistoryStore()
 engine         = DistributionEngine()
 
 subscriptions: dict[str, set[ClientSession]] = {}
@@ -137,6 +139,7 @@ async def lifespan(app: FastAPI):
         pass
     engine.consumer.stop()
     await snapshot_store.close()
+    await history_store.close()
     logger.info("Gateway shutdown")
 
 
@@ -309,6 +312,83 @@ async def get_metrics_prometheus():
         content=content,
         headers={"Content-Type": "text/plain; version=0.0.4"},
     )
+
+
+@app.get("/history/{symbol}")
+async def get_history(
+    symbol: str,
+    from_ts: str | None = None,
+    to_ts: str | None = None,
+    limit: str | None = None,
+):
+    symbol = symbol.upper()
+    parsed = _parse_history_params(from_ts, to_ts, limit)
+    if isinstance(parsed, JSONResponse):
+        return parsed
+
+    start_ts, end_ts, row_limit = parsed
+    try:
+        ticks = await history_store.fetch_ticks(
+            symbol=symbol,
+            from_ts=start_ts,
+            to_ts=end_ts,
+            limit=row_limit,
+        )
+    except (TimeoutError, asyncio.TimeoutError):
+        return JSONResponse(
+            status_code=504,
+            content={"error": "history query timed out"},
+        )
+
+    if not ticks:
+        return JSONResponse(
+            status_code=404,
+            content={"error": f"No history for {symbol}"},
+        )
+
+    return {
+        "symbol": symbol,
+        "from_ts": start_ts,
+        "to_ts": end_ts,
+        "count": len(ticks),
+        "ticks": ticks,
+    }
+
+
+def _parse_history_params(
+    from_ts: str | None,
+    to_ts: str | None,
+    limit: str | None,
+) -> tuple[int, int, int] | JSONResponse:
+    if from_ts is None or to_ts is None:
+        return JSONResponse(
+            status_code=400,
+            content={"error": "from_ts and to_ts required"},
+        )
+
+    try:
+        start_ts = int(from_ts)
+        end_ts = int(to_ts)
+        row_limit = int(limit) if limit is not None else DEFAULT_HISTORY_LIMIT
+    except (TypeError, ValueError):
+        return JSONResponse(
+            status_code=400,
+            content={"error": "from_ts, to_ts, and limit must be integers"},
+        )
+
+    if start_ts > end_ts:
+        return JSONResponse(
+            status_code=400,
+            content={"error": "from_ts must be <= to_ts"},
+        )
+
+    if row_limit <= 0:
+        return JSONResponse(
+            status_code=400,
+            content={"error": "limit must be positive"},
+        )
+
+    return start_ts, end_ts, row_limit
 
 
 # WebSocket endpoint

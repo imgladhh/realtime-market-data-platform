@@ -1,4 +1,5 @@
 import asyncio
+import json
 import time
 
 import pytest
@@ -18,6 +19,10 @@ def make_session(client_id: str = "gateway-test") -> ClientSession:
 
 def response_text(response) -> str:
     return response.body.decode()
+
+
+def response_json(response):
+    return json.loads(response.body.decode())
 
 
 @pytest.fixture(autouse=True)
@@ -273,3 +278,99 @@ async def test_prometheus_help_type_lines_format():
 
     assert "# TYPE market_data_events_dispatched_total counter" in lines
     assert "# TYPE market_data_throughput_events_per_sec gauge" in lines
+
+
+class FakeHistoryStore:
+    def __init__(self, ticks=None, exc=None):
+        self.ticks = ticks or []
+        self.exc = exc
+        self.calls = []
+
+    async def fetch_ticks(self, **kwargs):
+        self.calls.append(kwargs)
+        if self.exc:
+            raise self.exc
+        return self.ticks
+
+
+@pytest.mark.asyncio
+async def test_history_range_query_returns_ticks(monkeypatch):
+    store = FakeHistoryStore(ticks=[
+        {
+            "seq": 101,
+            "event_ts": 1710001234567,
+            "bid": 189.10,
+            "ask": 189.12,
+            "bid_size": 500,
+            "ask_size": 300,
+        }
+    ])
+    monkeypatch.setattr(gateway, "history_store", store)
+
+    response = await gateway.get_history(
+        "aapl",
+        from_ts="1710001200000",
+        to_ts="1710004800000",
+    )
+
+    assert response["symbol"] == "AAPL"
+    assert response["count"] == 1
+    assert response["ticks"][0]["seq"] == 101
+    assert store.calls[0]["symbol"] == "AAPL"
+    assert store.calls[0]["from_ts"] == 1710001200000
+
+
+@pytest.mark.asyncio
+async def test_history_from_after_to_returns_400():
+    response = await gateway.get_history("AAPL", from_ts="2", to_ts="1")
+
+    assert response.status_code == 400
+    assert response_json(response)["error"] == "from_ts must be <= to_ts"
+
+
+@pytest.mark.asyncio
+async def test_history_missing_params_returns_400():
+    response = await gateway.get_history("AAPL", from_ts=None, to_ts="1")
+
+    assert response.status_code == 400
+    assert response_json(response)["error"] == "from_ts and to_ts required"
+
+
+@pytest.mark.asyncio
+async def test_history_invalid_params_returns_400():
+    response = await gateway.get_history("AAPL", from_ts="nope", to_ts="1")
+
+    assert response.status_code == 400
+    assert response_json(response)["error"] == "from_ts, to_ts, and limit must be integers"
+
+
+@pytest.mark.asyncio
+async def test_history_non_positive_limit_returns_400():
+    response = await gateway.get_history("AAPL", from_ts="1", to_ts="2", limit="0")
+
+    assert response.status_code == 400
+    assert response_json(response)["error"] == "limit must be positive"
+
+
+@pytest.mark.asyncio
+async def test_history_no_ticks_returns_404(monkeypatch):
+    monkeypatch.setattr(gateway, "history_store", FakeHistoryStore(ticks=[]))
+
+    response = await gateway.get_history("AAPL", from_ts="1", to_ts="2")
+
+    assert response.status_code == 404
+    assert "No history for AAPL" in response_json(response)["error"]
+
+
+@pytest.mark.asyncio
+async def test_history_query_timeout_returns_504(monkeypatch):
+    monkeypatch.setattr(
+        gateway,
+        "history_store",
+        FakeHistoryStore(exc=asyncio.TimeoutError()),
+    )
+
+    response = await gateway.get_history("AAPL", from_ts="1", to_ts="2")
+
+    assert response.status_code == 504
+    assert response_json(response)["error"] == "history query timed out"

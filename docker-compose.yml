@@ -49,6 +49,23 @@ services:
       timeout: 5s
       retries: 5
 
+  timescaledb:
+    image: timescale/timescaledb:2.14.2-pg16
+    container_name: timescaledb
+    environment:
+      POSTGRES_DB: market_data
+      POSTGRES_USER: market
+      POSTGRES_PASSWORD: market
+    ports:
+      - "5432:5432"
+    volumes:
+      - timescale-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U market -d market_data"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
   # Optional: Kafka UI for debugging
   kafka-ui:
     image: provectuslabs/kafka-ui:latest
@@ -61,3 +78,6 @@ services:
     environment:
       KAFKA_CLUSTERS_0_NAME: local
       KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:29092
+
+volumes:
+  timescale-data:
