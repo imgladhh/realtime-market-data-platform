@@ -5,11 +5,11 @@ import uuid
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 
 from src.engine.snapshot_store import SnapshotStore
 from src.engine.engine import DistributionEngine
-from src.gateway.session import ClientSession, SlowConsumerPolicy
+from src.gateway.session import ClientSession, Encoding, SlowConsumerPolicy
 from src.gateway.aggregator import AggregationBuffer, AggregationMode
 
 logging.basicConfig(level=logging.INFO)
@@ -26,6 +26,16 @@ all_sessions: dict[str, ClientSession] = {}
 
 _total_events_dispatched = 0
 _fanout_start_time = 0.0
+
+
+def _parse_encoding(client_id: str, encoding_param: str | None) -> Encoding:
+    try:
+        return Encoding(encoding_param or Encoding.JSON.value)
+    except ValueError:
+        logger.warning(
+            f"[{client_id}] Unknown encoding '{encoding_param}', using json"
+        )
+        return Encoding.JSON
 
 
 # ── Fanout loop ───────────────────────────────────────────────────────────────
@@ -165,6 +175,118 @@ async def get_metrics_summary():
 
 # ── WebSocket endpoint ────────────────────────────────────────────────────────
 
+# Prometheus metrics endpoint
+
+def _client_label(client_id: str) -> str:
+    escaped = client_id.replace("\\", "\\\\").replace('"', '\\"')
+    return f'client_id="{escaped}"'
+
+
+def _append_metric_family(
+    lines: list[str],
+    name: str,
+    help_text: str,
+    metric_type: str,
+    samples: list[str],
+) -> None:
+    lines.append(f"# HELP {name} {help_text}")
+    lines.append(f"# TYPE {name} {metric_type}")
+    lines.extend(samples)
+    lines.append("")
+
+
+async def _prometheus_metrics_text() -> str:
+    elapsed = asyncio.get_event_loop().time() - _fanout_start_time
+    throughput = round(_total_events_dispatched / max(elapsed, 1), 1)
+
+    async with subscriptions_lock:
+        sessions = list(all_sessions.values())
+
+    lines: list[str] = []
+    _append_metric_family(
+        lines,
+        "market_data_connected_clients",
+        "Current number of connected WebSocket clients",
+        "gauge",
+        [f"market_data_connected_clients {len(sessions)}"],
+    )
+    _append_metric_family(
+        lines,
+        "market_data_events_dispatched_total",
+        "Total events dispatched since startup",
+        "counter",
+        [f"market_data_events_dispatched_total {_total_events_dispatched}"],
+    )
+    _append_metric_family(
+        lines,
+        "market_data_throughput_events_per_sec",
+        "Current fanout throughput",
+        "gauge",
+        [f"market_data_throughput_events_per_sec {throughput}"],
+    )
+
+    if sessions:
+        _append_metric_family(
+            lines,
+            "market_data_client_sent_total",
+            "Total messages sent per client",
+            "counter",
+            [
+                f"market_data_client_sent_total{{{_client_label(s.client_id)}}} {s.stats.sent}"
+                for s in sessions
+            ],
+        )
+        _append_metric_family(
+            lines,
+            "market_data_client_dropped_total",
+            "Total messages dropped per client",
+            "counter",
+            [
+                f"market_data_client_dropped_total{{{_client_label(s.client_id)}}} {s.stats.dropped}"
+                for s in sessions
+            ],
+        )
+
+        latency_sessions = [
+            s for s in sessions
+            if s.stats.latency.sample_count > 0
+        ]
+        if latency_sessions:
+            _append_metric_family(
+                lines,
+                "market_data_client_latency_p50_ms",
+                "Rolling p50 dispatch latency in ms",
+                "gauge",
+                [
+                    f"market_data_client_latency_p50_ms{{{_client_label(s.client_id)}}} {s.stats.latency.p50}"
+                    for s in latency_sessions
+                ],
+            )
+            _append_metric_family(
+                lines,
+                "market_data_client_latency_p99_ms",
+                "Rolling p99 dispatch latency in ms",
+                "gauge",
+                [
+                    f"market_data_client_latency_p99_ms{{{_client_label(s.client_id)}}} {s.stats.latency.p99}"
+                    for s in latency_sessions
+                ],
+            )
+
+    return "\n".join(lines).rstrip() + "\n"
+
+
+@app.get("/metrics/prometheus")
+async def get_metrics_prometheus():
+    content = await _prometheus_metrics_text()
+    return Response(
+        content=content,
+        headers={"Content-Type": "text/plain; version=0.0.4"},
+    )
+
+
+# WebSocket endpoint
+
 @app.websocket("/stream")
 async def websocket_stream(websocket: WebSocket):
     await websocket.accept()
@@ -176,11 +298,14 @@ async def websocket_stream(websocket: WebSocket):
         if mode_param == "agg_100ms"
         else AggregationMode.RAW
     )
+    encoding_param = websocket.query_params.get("encoding", "json")
+    enc = _parse_encoding(client_id, encoding_param)
 
     session = ClientSession(
         client_id=client_id,
         websocket=websocket,
         policy=SlowConsumerPolicy.DROP_OLDEST,
+        encoding=enc,
     )
 
     # Assign per-client aggregator and start it
@@ -199,7 +324,7 @@ async def websocket_stream(websocket: WebSocket):
         name=f"dispatch-{client_id}"
     )
 
-    logger.info(f"[{client_id}] Connected (mode={mode_param})")
+    logger.info(f"[{client_id}] Connected (mode={mode_param}, encoding={enc.value})")
 
     try:
         while True:

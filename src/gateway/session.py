@@ -5,6 +5,7 @@ import time
 from dataclasses import dataclass, field
 from enum import Enum
 from fastapi import WebSocket
+import msgpack
 
 logger = logging.getLogger(__name__)
 
@@ -15,6 +16,11 @@ SLOW_CLIENT_DROP_LIMIT = 100
 class SlowConsumerPolicy(str, Enum):
     DROP_OLDEST = "drop_oldest"
     DISCONNECT  = "disconnect"
+
+
+class Encoding(str, Enum):
+    JSON    = "json"
+    MSGPACK = "msgpack"
 
 
 @dataclass
@@ -89,10 +95,12 @@ class ClientSession:
         client_id: str,
         websocket: WebSocket,
         policy: SlowConsumerPolicy = SlowConsumerPolicy.DROP_OLDEST,
+        encoding: Encoding = Encoding.JSON,
     ):
         self.client_id     = client_id
         self.websocket     = websocket
         self.policy        = policy
+        self.encoding      = encoding
         self.subscriptions: set[str] = set()
         self.stats         = ClientStats()
         self.last_seq:     dict[str, int] = {}
@@ -183,7 +191,12 @@ class ClientSession:
                     self.stats.latency.record(event_ts)
 
                 try:
-                    await self.websocket.send_text(json.dumps(message))
+                    if self.encoding == Encoding.MSGPACK:
+                        await self.websocket.send_bytes(
+                            msgpack.packb(message, use_bin_type=True)
+                        )
+                    else:
+                        await self.websocket.send_text(json.dumps(message))
                     self.stats.sent += 1
                 except Exception as e:
                     logger.info(f"[{self.client_id}] Send failed: {e}")

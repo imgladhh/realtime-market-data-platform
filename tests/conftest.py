@@ -29,9 +29,14 @@ def make_websocket() -> AsyncMock:
     """Mock WebSocket that records sent messages."""
     ws = AsyncMock()
     ws.sent_messages = []
+    ws.sent_bytes = []
 
     async def send_text(msg):
         ws.sent_messages.append(msg)
 
+    async def send_bytes(msg):
+        ws.sent_bytes.append(msg)
+
     ws.send_text = send_text
+    ws.send_bytes = send_bytes
     return ws

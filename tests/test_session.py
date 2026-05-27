@@ -1,7 +1,8 @@
 import asyncio
 import json
+import msgpack
 import pytest
-from src.gateway.session import ClientSession, SlowConsumerPolicy
+from src.gateway.session import ClientSession, Encoding, SlowConsumerPolicy
 from src.gateway.aggregator import AggregationBuffer, AggregationMode
 from tests.conftest import make_event, make_websocket
 
@@ -9,12 +10,14 @@ from tests.conftest import make_event, make_websocket
 def make_session(
     policy=SlowConsumerPolicy.DROP_OLDEST,
     queue_size=5,
+    encoding=Encoding.JSON,
 ) -> ClientSession:
     ws = make_websocket()
     session = ClientSession(
         client_id="test-client",
         websocket=ws,
         policy=policy,
+        encoding=encoding,
     )
     session._queue = asyncio.Queue(maxsize=queue_size)
     session.aggregator = AggregationBuffer(mode=AggregationMode.RAW)
@@ -116,6 +119,50 @@ class TestWriterLoop:
 
         assert session.stats.sent == 2
         assert len(session.websocket.sent_messages) == 2
+        assert len(session.websocket.sent_bytes) == 0
+
+    @pytest.mark.asyncio
+    async def test_writer_sends_bytes_in_msgpack_mode(self):
+        session = make_session(queue_size=10, encoding=Encoding.MSGPACK)
+        session.start_writer()
+
+        session.enqueue({"symbol": "AAPL", "seq": 1, "bid": 189.10})
+
+        await asyncio.sleep(0.1)
+        await session.close()
+
+        assert session.stats.sent == 1
+        assert len(session.websocket.sent_bytes) == 1
+        assert len(session.websocket.sent_messages) == 0
+
+        decoded = msgpack.unpackb(session.websocket.sent_bytes[0], raw=False)
+        assert decoded["symbol"] == "AAPL"
+        assert decoded["seq"] == 1
+
+    @pytest.mark.asyncio
+    async def test_writer_sends_text_in_json_mode(self):
+        session = make_session(queue_size=10, encoding=Encoding.JSON)
+        session.start_writer()
+
+        session.enqueue({"symbol": "AAPL", "seq": 1, "bid": 189.10})
+
+        await asyncio.sleep(0.1)
+        await session.close()
+
+        assert session.stats.sent == 1
+        assert len(session.websocket.sent_messages) == 1
+        assert len(session.websocket.sent_bytes) == 0
+        assert json.loads(session.websocket.sent_messages[0])["seq"] == 1
+
+    def test_msgpack_payload_smaller_than_json(self):
+        payload = make_event(symbol="AAPL", seq=1).to_dict()
+
+        msgpack_bytes = msgpack.packb(payload, use_bin_type=True)
+        json_bytes = json.dumps(payload).encode()
+        reduction = 1 - (len(msgpack_bytes) / len(json_bytes))
+
+        assert len(msgpack_bytes) < len(json_bytes)
+        assert reduction >= 0.20
 
     @pytest.mark.asyncio
     async def test_writer_sends_correct_content(self):
