@@ -43,7 +43,7 @@ class KafkaConsumerBridge:
                 bid_size=int(d["bid_size"]),
                 ask_size=int(d["ask_size"]),
                 event_ts=int(d["event_ts"]),
-                server_ts=int(d["server_ts"]),
+                server_ts=MarketEvent.now_ms(),
                 seq=int(d["seq"]),
                 type=EventType(d.get("type", "quote")),
             )
@@ -100,27 +100,29 @@ class DistributionEngine:
 
     def __init__(self):
         self.consumer = KafkaConsumerBridge()
-        self.snapshot_store = SnapshotStore()
         self._processed = 0
 
     async def run(self):
         loop = asyncio.get_running_loop()
         self.consumer.start(loop)
+        snapshot_store = SnapshotStore()
         logger.info("DistributionEngine running...")
 
-        async for event in self.consumer.events():
-            await self.snapshot_store.update(event)
-            self._processed += 1
+        try:
+            async for event in self.consumer.events():
+                await snapshot_store.update(event)
+                self._processed += 1
 
-            if self._processed % 500 == 0:
-                logger.info(
-                    f"Processed {self._processed} events | "
-                    f"last={event.symbol} seq={event.seq}"
-                )
+                if self._processed % 500 == 0:
+                    logger.info(
+                        f"Processed {self._processed} events | "
+                        f"last={event.symbol} seq={event.seq}"
+                    )
+        finally:
+            await snapshot_store.close()
 
     async def shutdown(self):
         self.consumer.stop()
-        await self.snapshot_store.close()
 
 
 if __name__ == "__main__":

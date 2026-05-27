@@ -14,15 +14,17 @@ class SnapshotStore:
     async def update(self, event: MarketEvent) -> None:
         """Atomically update snapshot for a symbol."""
         key = f"snapshot:{event.symbol}"
-        await self.redis.hset(key, mapping={
-            "bid":      str(event.bid),
-            "ask":      str(event.ask),
-            "bid_size": str(event.bid_size),
-            "ask_size": str(event.ask_size),
-            "seq":      str(event.seq),
-            "ts":       str(event.server_ts),
-        })
-        await self.redis.expire(key, SNAPSHOT_TTL)
+        async with self.redis.pipeline(transaction=True) as pipe:
+            pipe.hset(key, mapping={
+                "bid":      str(event.bid),
+                "ask":      str(event.ask),
+                "bid_size": str(event.bid_size),
+                "ask_size": str(event.ask_size),
+                "seq":      str(event.seq),
+                "ts":       str(event.server_ts),
+            })
+            pipe.expire(key, SNAPSHOT_TTL)
+            await pipe.execute()
 
     async def get(self, symbol: str) -> SnapshotData | None:
         """Fetch current snapshot for a symbol."""

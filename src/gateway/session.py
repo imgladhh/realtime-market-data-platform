@@ -191,7 +191,7 @@ class ClientSession:
                     break
 
         except asyncio.CancelledError:
-            pass
+            raise
         finally:
             logger.info(
                 f"[{self.client_id}] Writer stopped | "

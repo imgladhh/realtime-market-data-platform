@@ -6,6 +6,8 @@ from src.models import MarketEvent
 
 logger = logging.getLogger(__name__)
 
+OUTPUT_MAX_SIZE = 1000
+
 
 class AggregationMode(str, Enum):
     RAW      = "raw"       # every tick, lowest latency
@@ -32,15 +34,25 @@ class AggregationBuffer:
         self.mode        = mode
         self.interval_ms = interval_ms
         self._buffer: dict[str, MarketEvent] = {}  # symbol -> latest event
-        self._output: asyncio.Queue[MarketEvent] = asyncio.Queue()
+        self._output: asyncio.Queue[MarketEvent] = asyncio.Queue(maxsize=OUTPUT_MAX_SIZE)
         self._flush_task: asyncio.Task | None = None
 
-    async def push(self, event: MarketEvent):
+    def push(self, event: MarketEvent):
         if self.mode == AggregationMode.RAW:
-            await self._output.put(event)
+            self._put_latest(event)
         else:
             # Buffer: latest event per symbol wins
             self._buffer[event.symbol] = event
+
+    def _put_latest(self, event: MarketEvent):
+        try:
+            self._output.put_nowait(event)
+        except asyncio.QueueFull:
+            try:
+                self._output.get_nowait()
+            except asyncio.QueueEmpty:
+                pass
+            self._output.put_nowait(event)
 
     async def _flush_loop(self):
         """Periodically flush buffered events to output queue."""
@@ -49,7 +61,7 @@ class AggregationBuffer:
             await asyncio.sleep(interval_sec)
             if self._buffer:
                 for event in self._buffer.values():
-                    await self._output.put(event)
+                    self._put_latest(event)
                 flushed = len(self._buffer)
                 self._buffer.clear()
                 logger.debug(f"Aggregator flushed {flushed} events")

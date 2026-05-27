@@ -1,9 +1,33 @@
 import pytest
 import pytest_asyncio
-from unittest.mock import AsyncMock, patch, MagicMock
+from unittest.mock import AsyncMock, MagicMock
 from src.engine.snapshot_store import SnapshotStore
 from src.models import MarketEvent, SnapshotData, EventType
 from tests.conftest import make_event
+
+
+class FakePipeline:
+    def __init__(self):
+        self.hset_calls = []
+        self.expire_calls = []
+        self.executed = False
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+    def hset(self, *args, **kwargs):
+        self.hset_calls.append((args, kwargs))
+        return self
+
+    def expire(self, *args):
+        self.expire_calls.append(args)
+        return self
+
+    async def execute(self):
+        self.executed = True
 
 
 class TestSnapshotStore:
@@ -16,6 +40,7 @@ class TestSnapshotStore:
         """Returns a SnapshotStore with a mocked Redis client."""
         store = SnapshotStore.__new__(SnapshotStore)
         mock_redis = AsyncMock()
+        mock_redis.pipeline = MagicMock(return_value=FakePipeline())
         store.redis = mock_redis
         return store, mock_redis
 
@@ -28,8 +53,9 @@ class TestSnapshotStore:
 
         await store.update(event)
 
-        mock_redis.hset.assert_called_once()
-        call_kwargs = mock_redis.hset.call_args
+        pipe = mock_redis.pipeline.return_value
+        assert len(pipe.hset_calls) == 1
+        call_kwargs = pipe.hset_calls[0]
         assert call_kwargs[0][0] == "snapshot:AAPL"
 
     @pytest.mark.asyncio
@@ -39,7 +65,8 @@ class TestSnapshotStore:
 
         await store.update(event)
 
-        mapping = mock_redis.hset.call_args[1]["mapping"]
+        pipe = mock_redis.pipeline.return_value
+        mapping = pipe.hset_calls[0][1]["mapping"]
         assert mapping["bid"] == "175.5"
         assert mapping["ask"] == "175.54"
         assert mapping["seq"] == "42"
@@ -51,7 +78,9 @@ class TestSnapshotStore:
 
         await store.update(event)
 
-        mock_redis.expire.assert_called_once_with("snapshot:AAPL", 86400)
+        pipe = mock_redis.pipeline.return_value
+        assert pipe.expire_calls == [("snapshot:AAPL", 86400)]
+        assert pipe.executed is True
 
     # ── get ───────────────────────────────────────────────────────────────────
 

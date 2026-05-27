@@ -51,7 +51,7 @@ async def fanout_loop():
 
         # 3. Push into each client's aggregation buffer
         for session in sessions:
-            await session.aggregator.push(event)
+            session.aggregator.push(event)
             _total_events_dispatched += 1
 
 
@@ -82,8 +82,9 @@ async def client_dispatch_loop(session: ClientSession):
             session.enqueue(event.to_dict())
 
     except asyncio.CancelledError:
-        pass
-    logger.info(f"[{session.client_id}] Dispatch loop stopped")
+        raise
+    finally:
+        logger.info(f"[{session.client_id}] Dispatch loop stopped")
 
 
 # ── Lifespan ──────────────────────────────────────────────────────────────────
@@ -94,6 +95,10 @@ async def lifespan(app: FastAPI):
     logger.info("Gateway started")
     yield
     task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
     engine.consumer.stop()
     await snapshot_store.close()
     logger.info("Gateway shutdown")
@@ -253,15 +258,10 @@ async def websocket_stream(websocket: WebSocket):
 async def _subscribe(session: ClientSession, symbol: str):
     """
     Subscribe flow:
-    1. Register in SubscriptionRegistry so fanout_loop delivers events
-    2. Send current snapshot with seq=N (client context initialization)
-    3. Seed last_seq[symbol] = N for gap detection
-    After this, client_dispatch_loop delivers seq > N via aggregator
+    1. Fetch and send current snapshot with seq=N
+    2. Seed last_seq[symbol] = N for gap detection
+    3. Register in SubscriptionRegistry so later fanout events are delivered
     """
-    async with subscriptions_lock:
-        subscriptions.setdefault(symbol, set()).add(session)
-    session.subscriptions.add(symbol)
-
     snapshot = await snapshot_store.get(symbol)
     if snapshot:
         # Send snapshot directly to queue (not through aggregator)
@@ -273,6 +273,10 @@ async def _subscribe(session: ClientSession, symbol: str):
         )
     else:
         logger.info(f"[{session.client_id}] Subscribed to {symbol} (no snapshot yet)")
+
+    async with subscriptions_lock:
+        subscriptions.setdefault(symbol, set()).add(session)
+        session.subscriptions.add(symbol)
 
 
 async def _unsubscribe(session: ClientSession, symbol: str):

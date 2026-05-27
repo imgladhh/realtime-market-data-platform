@@ -12,7 +12,7 @@ class TestAggregationBufferRaw:
         buf.start()
 
         event = make_event(symbol="AAPL", seq=1)
-        await buf.push(event)
+        buf.push(event)
 
         # In RAW mode, event should be immediately available
         result = await asyncio.wait_for(buf._output.get(), timeout=0.5)
@@ -26,7 +26,7 @@ class TestAggregationBufferRaw:
         buf.start()
 
         for i in range(5):
-            await buf.push(make_event(seq=i))
+            buf.push(make_event(seq=i))
 
         results = []
         for _ in range(5):
@@ -53,7 +53,7 @@ class TestAggregationBufferAgg100ms:
 
         # Push 3 AAPL events rapidly
         for i in range(3):
-            await buf.push(make_event(symbol="AAPL", seq=i, bid=189.0 + i))
+            buf.push(make_event(symbol="AAPL", seq=i, bid=189.0 + i))
 
         # Should NOT be available immediately (still buffering)
         with pytest.raises(asyncio.TimeoutError):
@@ -68,7 +68,7 @@ class TestAggregationBufferAgg100ms:
 
         # Push 3 AAPL events — only the latest should be emitted
         for i in range(3):
-            await buf.push(make_event(symbol="AAPL", seq=i, bid=189.0 + i))
+            buf.push(make_event(symbol="AAPL", seq=i, bid=189.0 + i))
 
         # Wait for flush
         await asyncio.sleep(0.15)
@@ -86,9 +86,9 @@ class TestAggregationBufferAgg100ms:
         buf = AggregationBuffer(mode=AggregationMode.AGG_100MS, interval_ms=100)
         buf.start()
 
-        await buf.push(make_event(symbol="AAPL", seq=1, bid=189.0))
-        await buf.push(make_event(symbol="TSLA", seq=2, bid=175.0))
-        await buf.push(make_event(symbol="AAPL", seq=3, bid=190.0))  # latest AAPL
+        buf.push(make_event(symbol="AAPL", seq=1, bid=189.0))
+        buf.push(make_event(symbol="TSLA", seq=2, bid=175.0))
+        buf.push(make_event(symbol="AAPL", seq=3, bid=190.0))  # latest AAPL
 
         await asyncio.sleep(0.15)
 
@@ -110,7 +110,7 @@ class TestAggregationBufferAgg100ms:
         buf = AggregationBuffer(mode=AggregationMode.AGG_100MS, interval_ms=100)
         buf.start()
 
-        await buf.push(make_event(symbol="AAPL", seq=1))
+        buf.push(make_event(symbol="AAPL", seq=1))
         await asyncio.sleep(0.15)
 
         # Buffer should be cleared after flush
