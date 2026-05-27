@@ -9,7 +9,12 @@ from fastapi.responses import JSONResponse, Response
 
 from src.engine.snapshot_store import SnapshotStore
 from src.engine.engine import DistributionEngine
-from src.gateway.session import ClientSession, Encoding, SlowConsumerPolicy
+from src.gateway.session import (
+    ClientSession,
+    Encoding,
+    SlowConsumerPolicy,
+    SubscriptionFilter,
+)
 from src.gateway.aggregator import AggregationBuffer, AggregationMode
 
 logging.basicConfig(level=logging.INFO)
@@ -39,6 +44,22 @@ def _parse_encoding(client_id: str, encoding_param: str | None) -> Encoding:
 
 
 # ── Fanout loop ───────────────────────────────────────────────────────────────
+
+def _parse_subscription_filter(payload) -> SubscriptionFilter | None:
+    if not isinstance(payload, dict):
+        return None
+
+    min_change_pct = payload.get("min_change_pct")
+    max_spread = payload.get("max_spread")
+    try:
+        return SubscriptionFilter(
+            min_change_pct=float(min_change_pct) if min_change_pct is not None else None,
+            max_spread=float(max_spread) if max_spread is not None else None,
+        )
+    except (TypeError, ValueError):
+        logger.warning("Invalid subscription filter %r, ignoring", payload)
+        return None
+
 
 async def fanout_loop():
     global _total_events_dispatched, _fanout_start_time
@@ -86,10 +107,15 @@ async def client_dispatch_loop(session: ClientSession):
                 if snapshot:
                     session.enqueue({"type": "snapshot", **snapshot.to_dict()})
                     session.last_seq[symbol] = snapshot.seq
+                    session.last_price[symbol] = snapshot.bid
+                continue
+
+            if not session.should_deliver(event):
                 continue
 
             # Normal incremental delivery
-            session.enqueue(event.to_dict())
+            if session.enqueue(event.to_dict()):
+                session.mark_delivered(event)
 
     except asyncio.CancelledError:
         raise
@@ -362,7 +388,7 @@ async def websocket_stream(websocket: WebSocket):
                     continue
 
                 if action == "subscribe":
-                    await _subscribe(session, symbol)
+                    await _subscribe(session, symbol, msg.get("filter"))
                 elif action == "unsubscribe":
                     await _unsubscribe(session, symbol)
                 else:
@@ -380,7 +406,7 @@ async def websocket_stream(websocket: WebSocket):
         await _cleanup(session)
 
 
-async def _subscribe(session: ClientSession, symbol: str):
+async def _subscribe(session: ClientSession, symbol: str, filter_payload=None):
     """
     Subscribe flow:
     1. Fetch and send current snapshot with seq=N
@@ -392,6 +418,7 @@ async def _subscribe(session: ClientSession, symbol: str):
         # Send snapshot directly to queue (not through aggregator)
         session.enqueue({"type": "snapshot", **snapshot.to_dict()})
         session.last_seq[symbol] = snapshot.seq
+        session.last_price[symbol] = snapshot.bid
         logger.info(
             f"[{session.client_id}] Subscribed to {symbol} "
             f"seq_seed={snapshot.seq}"
@@ -402,6 +429,11 @@ async def _subscribe(session: ClientSession, symbol: str):
     async with subscriptions_lock:
         subscriptions.setdefault(symbol, set()).add(session)
         session.subscriptions.add(symbol)
+        subscription_filter = _parse_subscription_filter(filter_payload)
+        if subscription_filter is None:
+            session.filters.pop(symbol, None)
+        else:
+            session.filters[symbol] = subscription_filter
 
 
 async def _unsubscribe(session: ClientSession, symbol: str):
@@ -409,6 +441,8 @@ async def _unsubscribe(session: ClientSession, symbol: str):
         subscriptions.get(symbol, set()).discard(session)
     session.subscriptions.discard(symbol)
     session.last_seq.pop(symbol, None)
+    session.filters.pop(symbol, None)
+    session.last_price.pop(symbol, None)
     logger.info(f"[{session.client_id}] Unsubscribed from {symbol}")
 
 

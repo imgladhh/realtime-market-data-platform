@@ -7,7 +7,7 @@ from src.gateway import gateway
 from src.gateway.aggregator import AggregationBuffer, AggregationMode
 from src.gateway.session import ClientSession, Encoding
 from src.models import SnapshotData
-from tests.conftest import make_websocket
+from tests.conftest import make_event, make_websocket
 
 
 def make_session(client_id: str = "gateway-test") -> ClientSession:
@@ -77,6 +77,109 @@ async def test_subscribe_sends_snapshot_and_seeds_seq_before_registering(monkeyp
     assert "AAPL" in session.subscriptions
 
 
+@pytest.mark.asyncio
+async def test_subscribe_stores_filter_and_seeds_last_price(monkeypatch):
+    snapshot = SnapshotData(
+        symbol="AAPL",
+        bid=189.1,
+        ask=189.12,
+        bid_size=500,
+        ask_size=300,
+        seq=42,
+        ts=1710001234567,
+    )
+
+    class Store:
+        async def get(self, symbol):
+            return snapshot
+
+    monkeypatch.setattr(gateway, "snapshot_store", Store())
+    session = make_session()
+
+    await gateway._subscribe(
+        session,
+        "AAPL",
+        {"min_change_pct": 0.05, "max_spread": 0.50},
+    )
+
+    assert session.filters["AAPL"].min_change_pct == 0.05
+    assert session.filters["AAPL"].max_spread == 0.50
+    assert session.last_price["AAPL"] == 189.1
+
+
+@pytest.mark.asyncio
+async def test_unsubscribe_clears_filter_and_last_price():
+    session = make_session()
+    session.subscriptions.add("AAPL")
+    session.filters["AAPL"] = gateway.SubscriptionFilter(min_change_pct=0.05)
+    session.last_price["AAPL"] = 189.1
+    async with gateway.subscriptions_lock:
+        gateway.subscriptions["AAPL"] = {session}
+
+    await gateway._unsubscribe(session, "AAPL")
+
+    assert "AAPL" not in session.filters
+    assert "AAPL" not in session.last_price
+    assert "AAPL" not in session.subscriptions
+
+
+@pytest.mark.asyncio
+async def test_client_dispatch_filters_incrementals():
+    session = make_session()
+    session.filters["AAPL"] = gateway.SubscriptionFilter(min_change_pct=0.05)
+    session.last_price["AAPL"] = 100.0
+    session.aggregator.start()
+
+    task = asyncio.create_task(gateway.client_dispatch_loop(session))
+    session.aggregator.push(make_event(symbol="AAPL", seq=101, bid=100.04))
+    session.aggregator.push(make_event(symbol="AAPL", seq=102, bid=100.05))
+
+    delivered = await asyncio.wait_for(session._queue.get(), timeout=0.5)
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert delivered["seq"] == 102
+    assert session.last_price["AAPL"] == 100.05
+
+
+@pytest.mark.asyncio
+async def test_gap_recovery_resets_last_price(monkeypatch):
+    snapshot = SnapshotData(
+        symbol="AAPL",
+        bid=200.0,
+        ask=200.1,
+        bid_size=500,
+        ask_size=300,
+        seq=200,
+        ts=1710001234567,
+    )
+
+    class Store:
+        async def get(self, symbol):
+            return snapshot
+
+    monkeypatch.setattr(gateway, "snapshot_store", Store())
+    session = make_session()
+    session.last_seq["AAPL"] = 100
+    session.last_price["AAPL"] = 100.0
+    session.aggregator.start()
+
+    task = asyncio.create_task(gateway.client_dispatch_loop(session))
+    session.aggregator.push(make_event(symbol="AAPL", seq=200))
+
+    delivered = await asyncio.wait_for(session._queue.get(), timeout=0.5)
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert delivered["type"] == "snapshot"
+    assert delivered["seq"] == 200
+    assert session.last_price["AAPL"] == 200.0
+
+
 def test_encoding_param_msgpack():
     assert gateway._parse_encoding("gateway-test", "msgpack") == Encoding.MSGPACK
 
@@ -90,6 +193,14 @@ def test_encoding_param_invalid_falls_back_to_json(caplog):
         assert gateway._parse_encoding("gateway-test", "protobuf") == Encoding.JSON
 
     assert "Unknown encoding 'protobuf'" in caplog.text
+
+
+def test_invalid_subscription_filter_is_ignored(caplog):
+    with caplog.at_level("WARNING"):
+        result = gateway._parse_subscription_filter({"min_change_pct": "nope"})
+
+    assert result is None
+    assert "Invalid subscription filter" in caplog.text
 
 
 @pytest.mark.asyncio

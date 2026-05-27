@@ -2,7 +2,12 @@ import asyncio
 import json
 import msgpack
 import pytest
-from src.gateway.session import ClientSession, Encoding, SlowConsumerPolicy
+from src.gateway.session import (
+    ClientSession,
+    Encoding,
+    SlowConsumerPolicy,
+    SubscriptionFilter,
+)
 from src.gateway.aggregator import AggregationBuffer, AggregationMode
 from tests.conftest import make_event, make_websocket
 
@@ -103,6 +108,83 @@ class TestGapDetection:
 
 
 # ── Writer loop ───────────────────────────────────────────────────────────────
+
+class TestConditionalDelivery:
+
+    def test_no_filter_delivers_all_events(self):
+        session = make_session()
+        assert session.should_deliver(make_event(symbol="AAPL", bid=100.0)) is True
+
+    def test_min_change_filters_below_threshold(self):
+        session = make_session()
+        session.filters["AAPL"] = SubscriptionFilter(min_change_pct=0.05)
+        session.last_price["AAPL"] = 100.0
+        assert session.should_deliver(make_event(symbol="AAPL", bid=100.04)) is False
+
+    def test_min_change_delivers_at_threshold(self):
+        session = make_session()
+        session.filters["AAPL"] = SubscriptionFilter(min_change_pct=0.05)
+        session.last_price["AAPL"] = 100.0
+        assert session.should_deliver(make_event(symbol="AAPL", bid=100.05)) is True
+
+    def test_max_spread_filters_above_threshold(self):
+        session = make_session()
+        session.filters["AAPL"] = SubscriptionFilter(max_spread=0.50)
+        assert session.should_deliver(
+            make_event(symbol="AAPL", bid=100.0, ask=100.51)
+        ) is False
+
+    def test_max_spread_delivers_at_threshold(self):
+        session = make_session()
+        session.filters["AAPL"] = SubscriptionFilter(max_spread=0.50)
+        assert session.should_deliver(
+            make_event(symbol="AAPL", bid=100.0, ask=100.50)
+        ) is True
+
+    def test_filters_use_and_semantics(self):
+        session = make_session()
+        session.filters["AAPL"] = SubscriptionFilter(
+            min_change_pct=0.05,
+            max_spread=0.50,
+        )
+        session.last_price["AAPL"] = 100.0
+        assert session.should_deliver(
+            make_event(symbol="AAPL", bid=100.10, ask=100.70)
+        ) is False
+        assert session.should_deliver(
+            make_event(symbol="AAPL", bid=100.10, ask=100.20)
+        ) is True
+
+    def test_min_change_delivers_when_no_last_price_baseline(self):
+        session = make_session()
+        session.filters["AAPL"] = SubscriptionFilter(min_change_pct=0.05)
+        assert session.should_deliver(make_event(symbol="AAPL", bid=100.01)) is True
+
+    def test_mark_delivered_updates_last_price(self):
+        session = make_session()
+        event = make_event(symbol="AAPL", bid=101.25)
+        assert session.enqueue(event.to_dict()) is True
+        session.mark_delivered(event)
+        assert session.last_price["AAPL"] == 101.25
+
+    def test_enqueue_failure_does_not_update_last_price(self):
+        session = make_session(
+            policy=SlowConsumerPolicy.DISCONNECT,
+            queue_size=1,
+        )
+        session.enqueue({"symbol": "AAPL", "seq": 1})
+        event = make_event(symbol="AAPL", bid=101.25)
+        assert session.enqueue(event.to_dict()) is False
+        assert "AAPL" not in session.last_price
+
+    def test_filtered_event_does_not_update_last_price(self):
+        session = make_session()
+        session.filters["AAPL"] = SubscriptionFilter(min_change_pct=0.05)
+        session.last_price["AAPL"] = 100.0
+        event = make_event(symbol="AAPL", bid=100.04)
+        assert session.should_deliver(event) is False
+        assert session.last_price["AAPL"] == 100.0
+
 
 class TestWriterLoop:
 

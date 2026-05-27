@@ -6,11 +6,13 @@ from dataclasses import dataclass, field
 from enum import Enum
 from fastapi import WebSocket
 import msgpack
+from src.models import MarketEvent
 
 logger = logging.getLogger(__name__)
 
 QUEUE_MAX_SIZE = 500
 SLOW_CLIENT_DROP_LIMIT = 100
+PERCENT_EPSILON = 1e-9
 
 
 class SlowConsumerPolicy(str, Enum):
@@ -21,6 +23,12 @@ class SlowConsumerPolicy(str, Enum):
 class Encoding(str, Enum):
     JSON    = "json"
     MSGPACK = "msgpack"
+
+
+@dataclass
+class SubscriptionFilter:
+    min_change_pct: float | None = None
+    max_spread: float | None = None
 
 
 @dataclass
@@ -104,6 +112,8 @@ class ClientSession:
         self.subscriptions: set[str] = set()
         self.stats         = ClientStats()
         self.last_seq:     dict[str, int] = {}
+        self.filters:      dict[str, SubscriptionFilter] = {}
+        self.last_price:   dict[str, float] = {}
         self.aggregator    = None  # set by gateway after construction
 
         self._queue: asyncio.Queue[dict] = asyncio.Queue(maxsize=QUEUE_MAX_SIZE)
@@ -136,6 +146,30 @@ class ClientSession:
         return gap
 
     # ── Enqueue ───────────────────────────────────────────────────────────────
+
+    def should_deliver(self, event: MarketEvent) -> bool:
+        subscription_filter = self.filters.get(event.symbol)
+        if subscription_filter is None:
+            return True
+
+        if subscription_filter.max_spread is not None:
+            spread = event.ask - event.bid
+            if spread > subscription_filter.max_spread:
+                return False
+
+        if subscription_filter.min_change_pct is not None:
+            last = self.last_price.get(event.symbol)
+            if last is None or last == 0:
+                return True
+
+            change_pct = abs((event.bid - last) / last) * 100
+            if change_pct + PERCENT_EPSILON < subscription_filter.min_change_pct:
+                return False
+
+        return True
+
+    def mark_delivered(self, event: MarketEvent) -> None:
+        self.last_price[event.symbol] = event.bid
 
     def enqueue(self, message: dict) -> bool:
         """
