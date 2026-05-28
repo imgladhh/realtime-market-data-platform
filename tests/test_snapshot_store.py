@@ -1,3 +1,4 @@
+import json
 import pytest
 import pytest_asyncio
 from unittest.mock import AsyncMock, MagicMock
@@ -41,6 +42,8 @@ class TestSnapshotStore:
         store = SnapshotStore.__new__(SnapshotStore)
         mock_redis = AsyncMock()
         mock_redis.pipeline = MagicMock(return_value=FakePipeline())
+        mock_redis.publish.return_value = 2
+        mock_redis.ping.return_value = True
         store.redis = mock_redis
         return store, mock_redis
 
@@ -81,6 +84,26 @@ class TestSnapshotStore:
         pipe = mock_redis.pipeline.return_value
         assert pipe.expire_calls == [("snapshot:AAPL", 86400)]
         assert pipe.executed is True
+
+    @pytest.mark.asyncio
+    async def test_publish_event_uses_symbol_channel(self):
+        store, mock_redis = self.make_store()
+        event = make_event(symbol="AAPL", seq=10)
+
+        subscribers = await store.publish_event(event)
+
+        assert subscribers == 2
+        mock_redis.publish.assert_called_once()
+        channel, payload = mock_redis.publish.call_args[0]
+        assert channel == "events:AAPL"
+        assert json.loads(payload)["seq"] == 10
+
+    @pytest.mark.asyncio
+    async def test_ping_delegates_to_redis(self):
+        store, mock_redis = self.make_store()
+
+        assert await store.ping() is True
+        mock_redis.ping.assert_awaited_once()
 
     # ── get ───────────────────────────────────────────────────────────────────
 

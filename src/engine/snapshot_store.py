@@ -1,10 +1,12 @@
 import redis.asyncio as aioredis
 import logging
+import json
 from src.models import MarketEvent, SnapshotData
 
 logger = logging.getLogger(__name__)
 
 SNAPSHOT_TTL = 86400  # 24 hours
+EVENT_CHANNEL_PREFIX = "events"
 
 
 class SnapshotStore:
@@ -33,6 +35,14 @@ class SnapshotStore:
         if not data:
             return None
         return SnapshotData.from_redis(symbol, data)
+
+    async def publish_event(self, event: MarketEvent) -> int:
+        """Publish a market event to Redis Pub/Sub after snapshot update."""
+        channel = f"{EVENT_CHANNEL_PREFIX}:{event.symbol}"
+        return await self.redis.publish(channel, json.dumps(event.to_dict()))
+
+    async def ping(self) -> bool:
+        return await self.redis.ping()
 
     async def close(self):
         await self.redis.aclose()

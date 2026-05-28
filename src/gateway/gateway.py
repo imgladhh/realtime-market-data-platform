@@ -1,4 +1,5 @@
 import asyncio
+import inspect
 import json
 import logging
 import uuid
@@ -8,7 +9,6 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse, Response
 
 from src.engine.snapshot_store import SnapshotStore
-from src.engine.engine import DistributionEngine
 from src.gateway.session import (
     ClientSession,
     Encoding,
@@ -16,6 +16,7 @@ from src.gateway.session import (
     SubscriptionFilter,
 )
 from src.gateway.aggregator import AggregationBuffer, AggregationMode
+from src.models import EventType, MarketEvent
 from src.storage.history_store import DEFAULT_HISTORY_LIMIT, HistoryStore
 
 logging.basicConfig(level=logging.INFO)
@@ -25,11 +26,14 @@ logger = logging.getLogger(__name__)
 
 snapshot_store = SnapshotStore()
 history_store  = HistoryStore()
-engine         = DistributionEngine()
+INSTANCE_ID    = str(uuid.uuid4())[:8]
 
 subscriptions: dict[str, set[ClientSession]] = {}
 subscriptions_lock = asyncio.Lock()
+pubsub_lock = asyncio.Lock()
 all_sessions: dict[str, ClientSession] = {}
+active_channels: set[str] = set()
+redis_pubsub = None
 
 _total_events_dispatched = 0
 _fanout_start_time = 0.0
@@ -63,29 +67,123 @@ def _parse_subscription_filter(payload) -> SubscriptionFilter | None:
         return None
 
 
+def _parse_pubsub_event(data) -> MarketEvent | None:
+    if isinstance(data, bytes):
+        data = data.decode()
+    try:
+        raw = json.loads(data)
+        return MarketEvent(
+            symbol=raw["symbol"],
+            bid=float(raw["bid"]),
+            ask=float(raw["ask"]),
+            bid_size=int(raw["bid_size"]),
+            ask_size=int(raw["ask_size"]),
+            event_ts=int(raw["event_ts"]),
+            server_ts=int(raw["server_ts"]),
+            seq=int(raw["seq"]),
+            type=EventType(raw.get("type", "quote")),
+        )
+    except Exception as exc:
+        logger.error("Failed to parse Redis Pub/Sub event: %s | data=%r", exc, data)
+        return None
+
+
+async def _close_pubsub(pubsub) -> None:
+    close = getattr(pubsub, "aclose", None) or pubsub.close
+    result = close()
+    if inspect.isawaitable(result):
+        await result
+
+
 async def fanout_loop():
-    global _total_events_dispatched, _fanout_start_time
+    global _total_events_dispatched, _fanout_start_time, redis_pubsub
 
-    loop = asyncio.get_running_loop()
-    engine.consumer.start(loop)
     _fanout_start_time = asyncio.get_event_loop().time()
-    logger.info("Fanout loop started")
+    backoff = 0.1
+    logger.info("Redis Pub/Sub fanout loop started")
 
-    async for event in engine.consumer.events():
-        # 1. Update Redis snapshot
-        await snapshot_store.update(event)
+    while True:
+        pubsub = snapshot_store.redis.pubsub(ignore_subscribe_messages=True)
+        try:
+            async with pubsub_lock:
+                redis_pubsub = pubsub
+                if active_channels:
+                    await pubsub.subscribe(*sorted(active_channels))
 
-        # 2. Get subscribers
-        async with subscriptions_lock:
-            sessions = subscriptions.get(event.symbol, set()).copy()
+            async for message in pubsub.listen():
+                if message.get("type") != "message":
+                    continue
 
-        if not sessions:
-            continue
+                event = _parse_pubsub_event(message.get("data"))
+                if event is None:
+                    continue
 
-        # 3. Push into each client's aggregation buffer
-        for session in sessions:
-            session.aggregator.push(event)
-            _total_events_dispatched += 1
+                await _fanout_event(event)
+                backoff = 0.1
+
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning("Redis Pub/Sub fanout error: %s; reconnecting", exc)
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, 5.0)
+        finally:
+            async with pubsub_lock:
+                if redis_pubsub is pubsub:
+                    redis_pubsub = None
+            await _close_pubsub(pubsub)
+
+
+async def _fanout_event(event: MarketEvent):
+    global _total_events_dispatched
+
+    async with subscriptions_lock:
+        sessions = subscriptions.get(event.symbol, set()).copy()
+
+    if not sessions:
+        return
+
+    for session in sessions:
+        session.aggregator.push(event)
+        _total_events_dispatched += 1
+
+
+def _event_channel(symbol: str) -> str:
+    return f"events:{symbol}"
+
+
+async def _subscribe_pubsub_symbol(symbol: str):
+    channel = _event_channel(symbol)
+    async with pubsub_lock:
+        if channel in active_channels:
+            return
+        active_channels.add(channel)
+        if redis_pubsub is not None:
+            try:
+                await redis_pubsub.subscribe(channel)
+            except Exception as exc:
+                logger.warning(
+                    "Failed to subscribe Redis Pub/Sub channel %s: %s",
+                    channel,
+                    exc,
+                )
+
+
+async def _unsubscribe_pubsub_symbol(symbol: str):
+    channel = _event_channel(symbol)
+    async with pubsub_lock:
+        if channel not in active_channels:
+            return
+        active_channels.remove(channel)
+        if redis_pubsub is not None:
+            try:
+                await redis_pubsub.unsubscribe(channel)
+            except Exception as exc:
+                logger.warning(
+                    "Failed to unsubscribe Redis Pub/Sub channel %s: %s",
+                    channel,
+                    exc,
+                )
 
 
 async def client_dispatch_loop(session: ClientSession):
@@ -137,7 +235,6 @@ async def lifespan(app: FastAPI):
         await task
     except asyncio.CancelledError:
         pass
-    engine.consumer.stop()
     await snapshot_store.close()
     await history_store.close()
     logger.info("Gateway shutdown")
@@ -147,6 +244,18 @@ app = FastAPI(title="Market Data Gateway", lifespan=lifespan)
 
 
 # ── REST endpoints ────────────────────────────────────────────────────────────
+
+@app.get("/health")
+async def get_health():
+    try:
+        await snapshot_store.ping()
+    except Exception:
+        return JSONResponse(
+            status_code=503,
+            content={"status": "degraded", "reason": "redis unreachable"},
+        )
+    return {"status": "ok", "instance": INSTANCE_ID}
+
 
 @app.get("/snapshot/{symbol}")
 async def get_snapshot(symbol: str):
@@ -506,8 +615,11 @@ async def _subscribe(session: ClientSession, symbol: str, filter_payload=None):
     else:
         logger.info(f"[{session.client_id}] Subscribed to {symbol} (no snapshot yet)")
 
+    should_subscribe = False
     async with subscriptions_lock:
-        subscriptions.setdefault(symbol, set()).add(session)
+        symbol_sessions = subscriptions.setdefault(symbol, set())
+        should_subscribe = len(symbol_sessions) == 0
+        symbol_sessions.add(session)
         session.subscriptions.add(symbol)
         subscription_filter = _parse_subscription_filter(filter_payload)
         if subscription_filter is None:
@@ -515,22 +627,39 @@ async def _subscribe(session: ClientSession, symbol: str, filter_payload=None):
         else:
             session.filters[symbol] = subscription_filter
 
+    if should_subscribe:
+        await _subscribe_pubsub_symbol(symbol)
+
 
 async def _unsubscribe(session: ClientSession, symbol: str):
+    should_unsubscribe = False
     async with subscriptions_lock:
-        subscriptions.get(symbol, set()).discard(session)
+        symbol_sessions = subscriptions.get(symbol, set())
+        symbol_sessions.discard(session)
+        should_unsubscribe = len(symbol_sessions) == 0
+        if should_unsubscribe:
+            subscriptions.pop(symbol, None)
     session.subscriptions.discard(symbol)
     session.last_seq.pop(symbol, None)
     session.filters.pop(symbol, None)
     session.last_price.pop(symbol, None)
+    if should_unsubscribe:
+        await _unsubscribe_pubsub_symbol(symbol)
     logger.info(f"[{session.client_id}] Unsubscribed from {symbol}")
 
 
 async def _cleanup(session: ClientSession):
+    symbols_to_unsubscribe = []
     async with subscriptions_lock:
         for symbol in session.subscriptions:
-            subscriptions.get(symbol, set()).discard(session)
+            symbol_sessions = subscriptions.get(symbol, set())
+            symbol_sessions.discard(session)
+            if not symbol_sessions:
+                subscriptions.pop(symbol, None)
+                symbols_to_unsubscribe.append(symbol)
         all_sessions.pop(session.client_id, None)
+    for symbol in symbols_to_unsubscribe:
+        await _unsubscribe_pubsub_symbol(symbol)
     await session.close()
     logger.info(f"[{session.client_id}] Cleaned up")
 

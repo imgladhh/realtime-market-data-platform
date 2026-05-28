@@ -2,7 +2,6 @@ import asyncio
 import json
 import logging
 import threading
-from confluent_kafka import Consumer, KafkaError
 from src.models import MarketEvent, EventType
 from src.engine.snapshot_store import SnapshotStore
 
@@ -52,6 +51,8 @@ class KafkaConsumerBridge:
             return None
 
     def _consume_loop(self):
+        from confluent_kafka import Consumer, KafkaError
+
         consumer = Consumer(self._config)
         consumer.subscribe([KAFKA_TOPIC])
         logger.info(f"Kafka consumer started, topic={KAFKA_TOPIC}")
@@ -102,6 +103,11 @@ class DistributionEngine:
         self.consumer = KafkaConsumerBridge()
         self._processed = 0
 
+    async def process_event(self, event: MarketEvent, snapshot_store: SnapshotStore):
+        await snapshot_store.update(event)
+        await snapshot_store.publish_event(event)
+        self._processed += 1
+
     async def run(self):
         loop = asyncio.get_running_loop()
         self.consumer.start(loop)
@@ -110,8 +116,7 @@ class DistributionEngine:
 
         try:
             async for event in self.consumer.events():
-                await snapshot_store.update(event)
-                self._processed += 1
+                await self.process_event(event, snapshot_store)
 
                 if self._processed % 500 == 0:
                     logger.info(
