@@ -1,4 +1,5 @@
 import asyncio
+import time
 
 import pytest
 
@@ -218,6 +219,37 @@ def test_commit_batch_uses_last_message_per_partition():
         for call in consumer.commit_args
     }
     assert committed_messages == {batch[1].message, batch[2].message}
+
+
+def test_continuous_partial_batch_flushes_at_latency_deadline(monkeypatch):
+    writer = TickWriter(
+        store=FakeStore(),
+        batch_max_size=500,
+        batch_max_latency_ms=100,
+    )
+    started = 10.0
+    monkeypatch.setattr(time, "monotonic", lambda: 10.101)
+
+    assert writer._should_flush([make_consumed(seq=1)], started) is True
+
+
+def test_full_batch_flushes_before_latency_deadline(monkeypatch):
+    writer = TickWriter(store=FakeStore(), batch_max_size=2)
+    monkeypatch.setattr(time, "monotonic", lambda: 10.001)
+
+    assert writer._should_flush(
+        [make_consumed(seq=1), make_consumed(seq=2)],
+        10.0,
+    ) is True
+
+
+def test_poll_timeout_never_exceeds_remaining_batch_deadline(monkeypatch):
+    writer = TickWriter(store=FakeStore(), batch_max_latency_ms=20)
+    monkeypatch.setattr(time, "monotonic", lambda: 10.015)
+
+    timeout = writer._poll_timeout([make_consumed(seq=1)], 10.0)
+
+    assert timeout == pytest.approx(0.005)
 
 
 @pytest.mark.asyncio

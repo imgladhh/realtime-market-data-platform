@@ -1,10 +1,11 @@
 # Real-Time Market Data Processor — Correctness Remediation Specification
 
-Status: P0 implemented; P1 and P2 proposed  
+Status: P0 and P1 implemented; P2 proposed
 Created: 2026-09-11  
 Scope: Teaching and portfolio project  
 Baseline: 94 unit tests passing before remediation  
 P0 validation: 110 unit tests passing on 2026-09-11
+P1 validation: 126 unit tests passing on 2026-09-11
 
 ## 1. Purpose
 

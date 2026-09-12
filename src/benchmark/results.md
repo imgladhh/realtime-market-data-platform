@@ -45,6 +45,12 @@ JSON saturates at ~570k ops/sec; msgpack handles ~1.6M ops/sec with headroom to 
 
 ## 2. Dispatch Latency Benchmark
 
+> **Stale evidence:** The figures below were produced by the previous benchmark,
+> which did not read or validate WebSocket frames and averaged per-client p99s.
+> They are retained only as historical context and must not be used as current
+> NFR evidence. Rerun `load_bench` and replace this section before making a
+> latency or zero-drop claim.
+
 Measures end-to-end dispatch latency (time from `event_ts` on the MarketEvent to when it is written to the WebSocket) under increasing concurrent client load.
 
 **Setup:**

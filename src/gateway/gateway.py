@@ -4,6 +4,7 @@ import json
 import logging
 import uuid
 from contextlib import asynccontextmanager
+from dataclasses import dataclass, field
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse, Response
@@ -34,7 +35,20 @@ subscriptions_lock = asyncio.Lock()
 pubsub_lock = asyncio.Lock()
 all_sessions: dict[str, ClientSession] = {}
 active_channels: set[str] = set()
+confirmed_channels: set[str] = set()
 redis_pubsub = None
+INITIALIZATION_BUFFER_MAX_SIZE = 500
+
+
+@dataclass
+class SubscriptionInitialization:
+    events: list[MarketEvent] = field(default_factory=list)
+    overflowed: bool = False
+
+
+initializing_subscriptions: dict[
+    str, dict[ClientSession, SubscriptionInitialization]
+] = {}
 
 _total_events_dispatched = 0
 _fanout_start_time = 0.0
@@ -96,6 +110,14 @@ async def _close_pubsub(pubsub) -> None:
         await result
 
 
+async def _subscribe_desired_channels(pubsub) -> None:
+    confirmed_channels.clear()
+    if active_channels:
+        channels = sorted(active_channels)
+        await pubsub.subscribe(*channels)
+        confirmed_channels.update(channels)
+
+
 async def fanout_loop():
     global _total_events_dispatched, _fanout_start_time, redis_pubsub
 
@@ -108,8 +130,7 @@ async def fanout_loop():
         try:
             async with pubsub_lock:
                 redis_pubsub = pubsub
-                if active_channels:
-                    await pubsub.subscribe(*sorted(active_channels))
+                await _subscribe_desired_channels(pubsub)
 
             async for message in pubsub.listen():
                 if message.get("type") != "message":
@@ -132,6 +153,7 @@ async def fanout_loop():
             async with pubsub_lock:
                 if redis_pubsub is pubsub:
                     redis_pubsub = None
+                    confirmed_channels.clear()
             await _close_pubsub(pubsub)
 
 
@@ -140,6 +162,14 @@ async def _fanout_event(event: MarketEvent):
 
     async with subscriptions_lock:
         sessions = subscriptions.get(event.symbol, set()).copy()
+        initializations = list(
+            initializing_subscriptions.get(event.symbol, {}).values()
+        )
+        for initialization in initializations:
+            if len(initialization.events) >= INITIALIZATION_BUFFER_MAX_SIZE:
+                initialization.overflowed = True
+            else:
+                initialization.events.append(event)
 
     if not sessions:
         return
@@ -153,21 +183,35 @@ def _event_channel(symbol: str) -> str:
     return f"events:{symbol}"
 
 
-async def _subscribe_pubsub_symbol(symbol: str):
+async def _subscribe_pubsub_symbol(symbol: str) -> bool:
     channel = _event_channel(symbol)
     async with pubsub_lock:
-        if channel in active_channels:
-            return
         active_channels.add(channel)
-        if redis_pubsub is not None:
-            try:
-                await redis_pubsub.subscribe(channel)
-            except Exception as exc:
-                logger.warning(
-                    "Failed to subscribe Redis Pub/Sub channel %s: %s",
-                    channel,
-                    exc,
-                )
+        if channel in confirmed_channels:
+            return True
+        if redis_pubsub is None:
+            return False
+        try:
+            await redis_pubsub.subscribe(channel)
+        except Exception as exc:
+            logger.warning(
+                "Failed to subscribe Redis Pub/Sub channel %s: %s",
+                channel,
+                exc,
+            )
+            return False
+        confirmed_channels.add(channel)
+        return True
+
+
+async def _ensure_pubsub_subscription(symbol: str) -> bool:
+    backoff = 0.05
+    for _ in range(5):
+        if await _subscribe_pubsub_symbol(symbol):
+            return True
+        await asyncio.sleep(backoff)
+        backoff = min(backoff * 2, 0.5)
+    return False
 
 
 async def _unsubscribe_pubsub_symbol(symbol: str):
@@ -176,6 +220,7 @@ async def _unsubscribe_pubsub_symbol(symbol: str):
         if channel not in active_channels:
             return
         active_channels.remove(channel)
+        confirmed_channels.discard(channel)
         if redis_pubsub is not None:
             try:
                 await redis_pubsub.unsubscribe(channel)
@@ -185,6 +230,15 @@ async def _unsubscribe_pubsub_symbol(symbol: str):
                     channel,
                     exc,
                 )
+
+
+async def _remove_desired_channel_if_unused(symbol: str) -> None:
+    async with subscriptions_lock:
+        in_use = bool(subscriptions.get(symbol)) or bool(
+            initializing_subscriptions.get(symbol)
+        )
+    if not in_use:
+        await _unsubscribe_pubsub_symbol(symbol)
 
 
 async def client_dispatch_loop(session: ClientSession):
@@ -311,15 +365,39 @@ async def get_metrics_summary():
     if not sessions:
         return {"message": "no connected clients"}
 
-    all_p50 = [s.stats.latency.p50 for s in sessions if s.stats.latency.sample_count > 0]
-    all_p99 = [s.stats.latency.p99 for s in sessions if s.stats.latency.sample_count > 0]
+    latency_sessions = [
+        s for s in sessions if s.stats.latency.sample_count > 0
+    ]
+    samples = [
+        sample
+        for session in latency_sessions
+        for sample in session.stats.latency.samples
+    ]
+
+    def percentile(values: list[float], p: float) -> float:
+        if not values:
+            return 0
+        ordered = sorted(values)
+        index = min(int(len(ordered) * p / 100), len(ordered) - 1)
+        return round(ordered[index], 2)
 
     return {
-        "clients":         len(sessions),
-        "avg_p50_ms":      round(sum(all_p50) / len(all_p50), 2) if all_p50 else 0,
-        "avg_p99_ms":      round(sum(all_p99) / len(all_p99), 2) if all_p99 else 0,
-        "total_sent":      sum(s.stats.sent for s in sessions),
-        "total_dropped":   sum(s.stats.dropped for s in sessions),
+        "clients": len(sessions),
+        "overall_p50_ms": percentile(samples, 50),
+        "overall_p99_ms": percentile(samples, 99),
+        "average_client_p50_ms": round(
+            sum(s.stats.latency.p50 for s in latency_sessions)
+            / len(latency_sessions),
+            2,
+        ) if latency_sessions else 0,
+        "average_client_p99_ms": round(
+            sum(s.stats.latency.p99 for s in latency_sessions)
+            / len(latency_sessions),
+            2,
+        ) if latency_sessions else 0,
+        "latency_samples": len(samples),
+        "total_sent": sum(s.stats.sent for s in sessions),
+        "total_dropped": sum(s.stats.dropped for s in sessions),
     }
 
 
@@ -614,33 +692,69 @@ async def _subscribe(session: ClientSession, symbol: str, filter_payload=None):
     2. Seed last_seq[symbol] = N for gap detection
     3. Register in SubscriptionRegistry so later fanout events are delivered
     """
-    snapshot = await snapshot_store.get(symbol)
-    if snapshot:
-        # Send snapshot directly to queue (not through aggregator)
-        session.enqueue({"type": "snapshot", **snapshot.to_dict()})
-        session.last_seq[symbol] = snapshot.seq
-        session.last_price[symbol] = snapshot.bid
-        logger.info(
-            f"[{session.client_id}] Subscribed to {symbol} "
-            f"seq_seed={snapshot.seq}"
+    if not await _ensure_pubsub_subscription(symbol):
+        session.enqueue({"error": f"subscription unavailable for {symbol}"})
+        logger.warning(
+            "[%s] Subscription to %s failed: Pub/Sub channel not confirmed",
+            session.client_id,
+            symbol,
         )
-    else:
-        logger.info(f"[{session.client_id}] Subscribed to {symbol} (no snapshot yet)")
+        await _remove_desired_channel_if_unused(symbol)
+        return False
 
-    should_subscribe = False
+    subscription_filter = _parse_subscription_filter(filter_payload)
+    initialization = SubscriptionInitialization()
     async with subscriptions_lock:
-        symbol_sessions = subscriptions.setdefault(symbol, set())
-        should_subscribe = len(symbol_sessions) == 0
-        symbol_sessions.add(session)
-        session.subscriptions.add(symbol)
-        subscription_filter = _parse_subscription_filter(filter_payload)
-        if subscription_filter is None:
-            session.filters.pop(symbol, None)
-        else:
-            session.filters[symbol] = subscription_filter
+        initializing_subscriptions.setdefault(symbol, {})[session] = initialization
 
-    if should_subscribe:
-        await _subscribe_pubsub_symbol(symbol)
+    try:
+        snapshot = await snapshot_store.get(symbol)
+        async with subscriptions_lock:
+            current = initializing_subscriptions.get(symbol, {}).get(session)
+            if current is not initialization or initialization.overflowed:
+                raise RuntimeError("subscription initialization buffer overflow")
+
+            if snapshot:
+                if not session.enqueue({"type": "snapshot", **snapshot.to_dict()}):
+                    raise RuntimeError("outbound queue unavailable during subscribe")
+                session.last_seq[symbol] = snapshot.seq
+                session.last_price[symbol] = snapshot.bid
+
+            for event in sorted(initialization.events, key=lambda item: item.seq):
+                if snapshot is None or event.seq > snapshot.seq:
+                    session.aggregator.push(event)
+
+            initializing_subscriptions[symbol].pop(session, None)
+            if not initializing_subscriptions[symbol]:
+                initializing_subscriptions.pop(symbol, None)
+            subscriptions.setdefault(symbol, set()).add(session)
+            session.subscriptions.add(symbol)
+            if subscription_filter is None:
+                session.filters.pop(symbol, None)
+            else:
+                session.filters[symbol] = subscription_filter
+
+        if snapshot:
+            logger.info(
+                f"[{session.client_id}] Subscribed to {symbol} "
+                f"seq_seed={snapshot.seq}"
+            )
+        else:
+            logger.info(f"[{session.client_id}] Subscribed to {symbol} (no snapshot yet)")
+        return True
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        session.enqueue({"error": f"subscription failed for {symbol}"})
+        logger.warning("[%s] Subscription to %s failed: %s", session.client_id, symbol, exc)
+        return False
+    finally:
+        async with subscriptions_lock:
+            symbol_initializations = initializing_subscriptions.get(symbol, {})
+            symbol_initializations.pop(session, None)
+            if not symbol_initializations:
+                initializing_subscriptions.pop(symbol, None)
+        await _remove_desired_channel_if_unused(symbol)
 
 
 async def _unsubscribe(session: ClientSession, symbol: str):
@@ -663,6 +777,12 @@ async def _unsubscribe(session: ClientSession, symbol: str):
 async def _cleanup(session: ClientSession):
     symbols_to_unsubscribe = []
     async with subscriptions_lock:
+        for symbol, symbol_initializations in list(initializing_subscriptions.items()):
+            symbol_initializations.pop(session, None)
+            if not symbol_initializations:
+                initializing_subscriptions.pop(symbol, None)
+                if not subscriptions.get(symbol):
+                    symbols_to_unsubscribe.append(symbol)
         for symbol in session.subscriptions:
             symbol_sessions = subscriptions.get(symbol, set())
             symbol_sessions.discard(session)

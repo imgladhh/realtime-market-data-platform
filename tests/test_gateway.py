@@ -39,16 +39,20 @@ class PingStore:
 async def reset_gateway_state():
     async with gateway.subscriptions_lock:
         gateway.subscriptions.clear()
+        gateway.initializing_subscriptions.clear()
         gateway.all_sessions.clear()
     async with gateway.pubsub_lock:
         gateway.active_channels.clear()
-        gateway.redis_pubsub = None
+        gateway.confirmed_channels.clear()
+        gateway.redis_pubsub = FakePubSub()
     yield
     async with gateway.subscriptions_lock:
         gateway.subscriptions.clear()
+        gateway.initializing_subscriptions.clear()
         gateway.all_sessions.clear()
     async with gateway.pubsub_lock:
         gateway.active_channels.clear()
+        gateway.confirmed_channels.clear()
         gateway.redis_pubsub = None
 
 
@@ -65,15 +69,22 @@ class DelayedSnapshotStore:
 
 
 class FakePubSub:
-    def __init__(self, fail_subscribe=False, fail_unsubscribe=False):
+    def __init__(
+        self,
+        fail_subscribe=False,
+        fail_unsubscribe=False,
+        subscribe_failures=0,
+    ):
         self.subscribed = []
         self.unsubscribed = []
         self.closed = False
         self.fail_subscribe = fail_subscribe
         self.fail_unsubscribe = fail_unsubscribe
+        self.subscribe_failures = subscribe_failures
 
     async def subscribe(self, *channels):
-        if self.fail_subscribe:
+        if self.fail_subscribe or self.subscribe_failures > 0:
+            self.subscribe_failures -= 1
             raise RuntimeError("subscribe failed")
         self.subscribed.extend(channels)
 
@@ -138,6 +149,57 @@ async def test_subscribe_sends_snapshot_and_seeds_seq_before_registering(monkeyp
     async with gateway.subscriptions_lock:
         assert session in gateway.subscriptions["AAPL"]
     assert "AAPL" in session.subscriptions
+
+
+@pytest.mark.asyncio
+async def test_subscribe_buffers_overlap_and_releases_only_newer_event(monkeypatch):
+    snapshot = SnapshotData(
+        symbol="AAPL",
+        bid=189.1,
+        ask=189.12,
+        bid_size=500,
+        ask_size=300,
+        seq=42,
+        ts=1710001234567,
+    )
+    store = DelayedSnapshotStore(snapshot)
+    monkeypatch.setattr(gateway, "snapshot_store", store)
+    session = make_session()
+
+    task = asyncio.create_task(gateway._subscribe(session, "AAPL"))
+    await store.entered.wait()
+    await gateway._fanout_event(make_event(symbol="AAPL", seq=42))
+    await gateway._fanout_event(make_event(symbol="AAPL", seq=43))
+
+    assert session._queue.empty()
+    assert session.aggregator._output.empty()
+
+    store.release.set()
+    assert await task is True
+
+    snapshot_message = session._queue.get_nowait()
+    incremental = session.aggregator._output.get_nowait()
+    assert snapshot_message["type"] == "snapshot"
+    assert snapshot_message["seq"] == 42
+    assert incremental.seq == 43
+
+
+@pytest.mark.asyncio
+async def test_subscribe_snapshot_failure_rolls_back_and_reports_error(monkeypatch):
+    class FailingStore:
+        async def get(self, symbol):
+            raise RuntimeError("snapshot unavailable")
+
+    monkeypatch.setattr(gateway, "snapshot_store", FailingStore())
+    session = make_session()
+
+    assert await gateway._subscribe(session, "AAPL") is False
+
+    assert session not in gateway.subscriptions.get("AAPL", set())
+    assert session not in gateway.initializing_subscriptions.get("AAPL", {})
+    assert "AAPL" not in session.subscriptions
+    assert "events:AAPL" not in gateway.active_channels
+    assert "subscription failed" in session._queue.get_nowait()["error"]
 
 
 @pytest.mark.asyncio
@@ -222,7 +284,7 @@ async def test_unsubscribe_last_client_unsubscribes_pubsub_channel():
 
 
 @pytest.mark.asyncio
-async def test_pubsub_subscribe_failure_keeps_channel_active(caplog):
+async def test_pubsub_subscribe_failure_is_not_confirmed(caplog):
     pubsub = FakePubSub(fail_subscribe=True)
     async with gateway.pubsub_lock:
         gateway.redis_pubsub = pubsub
@@ -231,7 +293,75 @@ async def test_pubsub_subscribe_failure_keeps_channel_active(caplog):
         await gateway._subscribe_pubsub_symbol("AAPL")
 
     assert "events:AAPL" in gateway.active_channels
+    assert "events:AAPL" not in gateway.confirmed_channels
     assert "Failed to subscribe Redis Pub/Sub channel events:AAPL" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_pubsub_subscribe_retries_transient_failure():
+    pubsub = FakePubSub(subscribe_failures=1)
+    async with gateway.pubsub_lock:
+        gateway.redis_pubsub = pubsub
+
+    assert await gateway._ensure_pubsub_subscription("AAPL") is True
+    assert pubsub.subscribed == ["events:AAPL"]
+    assert "events:AAPL" in gateway.confirmed_channels
+
+
+@pytest.mark.asyncio
+async def test_subscribe_exhausted_pubsub_retries_rolls_back_desired(monkeypatch):
+    pubsub = FakePubSub(fail_subscribe=True)
+    async with gateway.pubsub_lock:
+        gateway.redis_pubsub = pubsub
+    monkeypatch.setattr(gateway.asyncio, "sleep", AsyncNoop())
+    session = make_session()
+
+    assert await gateway._subscribe(session, "AAPL") is False
+
+    assert "events:AAPL" not in gateway.active_channels
+    assert "events:AAPL" not in gateway.confirmed_channels
+    assert "AAPL" not in session.subscriptions
+
+
+class AsyncNoop:
+    def __call__(self, delay):
+        async def completed():
+            return None
+        return completed()
+
+
+@pytest.mark.asyncio
+async def test_concurrent_first_subscribers_share_one_redis_subscribe(monkeypatch):
+    class Store:
+        async def get(self, symbol):
+            return None
+
+    pubsub = FakePubSub()
+    monkeypatch.setattr(gateway, "snapshot_store", Store())
+    async with gateway.pubsub_lock:
+        gateway.redis_pubsub = pubsub
+
+    first, second = make_session("first"), make_session("second")
+    results = await asyncio.gather(
+        gateway._subscribe(first, "AAPL"),
+        gateway._subscribe(second, "AAPL"),
+    )
+
+    assert results == [True, True]
+    assert pubsub.subscribed == ["events:AAPL"]
+    assert gateway.subscriptions["AAPL"] == {first, second}
+
+
+@pytest.mark.asyncio
+async def test_pubsub_reconnect_rebuilds_confirmed_from_desired():
+    pubsub = FakePubSub()
+    gateway.active_channels.update({"events:TSLA", "events:AAPL"})
+    gateway.confirmed_channels.add("events:STALE")
+
+    await gateway._subscribe_desired_channels(pubsub)
+
+    assert pubsub.subscribed == ["events:AAPL", "events:TSLA"]
+    assert gateway.confirmed_channels == {"events:AAPL", "events:TSLA"}
 
 
 @pytest.mark.asyncio
@@ -240,11 +370,13 @@ async def test_pubsub_unsubscribe_failure_removes_channel(caplog):
     async with gateway.pubsub_lock:
         gateway.redis_pubsub = pubsub
         gateway.active_channels.add("events:AAPL")
+        gateway.confirmed_channels.add("events:AAPL")
 
     with caplog.at_level("WARNING"):
         await gateway._unsubscribe_pubsub_symbol("AAPL")
 
     assert "events:AAPL" not in gateway.active_channels
+    assert "events:AAPL" not in gateway.confirmed_channels
     assert "Failed to unsubscribe Redis Pub/Sub channel events:AAPL" in caplog.text
 
 
@@ -504,6 +636,23 @@ async def test_prometheus_help_type_lines_format():
 
     assert "# TYPE market_data_events_dispatched_total counter" in lines
     assert "# TYPE market_data_throughput_events_per_sec gauge" in lines
+
+
+@pytest.mark.asyncio
+async def test_metrics_summary_reports_population_and_average_client_percentiles():
+    first = make_session(client_id="first")
+    second = make_session(client_id="second")
+    first.stats.latency._samples = [1.0, 2.0]
+    second.stats.latency._samples = [100.0]
+    async with gateway.subscriptions_lock:
+        gateway.all_sessions.update({"first": first, "second": second})
+
+    summary = await gateway.get_metrics_summary()
+
+    assert summary["overall_p50_ms"] == 2.0
+    assert summary["overall_p99_ms"] == 100.0
+    assert summary["average_client_p99_ms"] == 51.0
+    assert summary["latency_samples"] == 3
 
 
 class FakeHistoryStore:

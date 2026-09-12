@@ -262,12 +262,16 @@ Indexes:
 
 ```
 INSTANCE_ID:    str (uuid4[:8]) — stable for the life of the process; returned by /health
-active_channels: set[str]       — Redis Pub/Sub channels this instance is subscribed to
+active_channels: set[str]       — desired Redis Pub/Sub channels for local demand
+confirmed_channels: set[str]    — channels confirmed on the current Pub/Sub connection
 redis_pubsub:   PubSub | None   — active Pub/Sub connection; None while reconnecting
-pubsub_lock:    asyncio.Lock    — guards active_channels and redis_pubsub together
+pubsub_lock:    asyncio.Lock    — guards desired/confirmed channel state and redis_pubsub
 ```
 
-**Invariant:** A channel `events:{symbol}` is in `active_channels` if and only if at least one local `ClientSession` is subscribed to `symbol`. Transitions are edge-triggered: subscribe on first client, unsubscribe on last client.
+**Invariant:** `active_channels` represents desired local demand; a channel enters
+`confirmed_channels` only after Redis confirms `SUBSCRIBE`. Reconnect clears and
+rebuilds the confirmed set from desired channels. Client initialization uses a
+bounded per-session/symbol event buffer until its snapshot boundary is installed.
 
 ### 4.5 ClientSession
 
@@ -312,9 +316,12 @@ key = symbol → partition = hash(symbol) % num_partitions
 **Solution:**
 ```
 Client connects → subscribes to AAPL
+  → Server confirms Redis subscription to events:AAPL
+  → Server marks the client/symbol as initializing and buffers observed events
   → Server reads snapshot:AAPL from Redis (seq=N)
   → Server sends snapshot to client (type="snapshot")
   → Server seeds client.last_seq["AAPL"] = N
+  → Server discards buffered seq <= N and releases buffered seq > N in order
   → Server registers client in SubscriptionRegistry["AAPL"]
   → Dispatch loop delivers events with seq > N
   → Client checks each per-symbol seq: expected N+1; a larger value triggers re-snapshot
@@ -469,9 +476,9 @@ Early implementation had a `_pending` dict in ClientSession that tracked the lat
 | HistoryStore DB unavailable at query time | asyncpg pool error | Returns HTTP 504 to caller; no fanout impact |
 | TickWriter consumer lag | Kafka consumer group lag metric | Operational alert only; no impact on `gateway-engine` group |
 | Gateway instance crash | Load balancer `/health` probe fails | Sticky clients reconnect; routed to surviving instances; re-subscribe yields fresh snapshot |
-| Redis Pub/Sub disconnect in gateway | Exception in `pubsub.listen()` | `fanout_loop` reconnects with exponential back-off (max 5s); re-subscribes `active_channels` on reconnect; gap detection re-seeds affected clients |
-| DistributionEngine crash | No messages on Pub/Sub channels | Clients see no updates; gap detected on engine restart; snapshot re-seed restores state |
-| Pub/Sub subscribe/unsubscribe fails | Exception in `_subscribe_pubsub_symbol` | Logged as WARNING; `active_channels` retains the channel; next `fanout_loop` reconnect re-subscribes |
+| Redis Pub/Sub disconnect in gateway | Exception in `pubsub.listen()` | `fanout_loop` reconnects with exponential back-off (max 5s), clears confirmations, and re-subscribes every desired channel |
+| DistributionEngine Redis operation fails | Exception from snapshot update or publish | Retry the same unacknowledged event with exponential back-off (max 5s); shutdown leaves it replayable |
+| Pub/Sub subscribe fails | Exception in `_subscribe_pubsub_symbol` | Bounded immediate retry; the channel is never marked confirmed on failure and the initiating client is rolled back if retries fail |
 | Thundering herd on instance restart | All sticky clients reconnect simultaneously | Snapshot fetches serialise through Redis; existing per-client bounded queue behaviour unchanged |
 
 ---
@@ -628,8 +635,11 @@ Aggregated stats across all connected clients.
 ```
 {
   "clients": 3,
-  "avg_p50_ms": 8.33,
-  "avg_p99_ms": 10.22,
+  "overall_p50_ms": 8.33,
+  "overall_p99_ms": 10.22,
+  "average_client_p50_ms": 8.10,
+  "average_client_p99_ms": 10.05,
+  "latency_samples": 1000,
   "total_sent": 25687,
   "total_dropped": 0
 }

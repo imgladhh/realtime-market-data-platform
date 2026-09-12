@@ -11,6 +11,8 @@ from src.engine.snapshot_store import SnapshotStore
 logger = logging.getLogger(__name__)
 
 KAFKA_TOPIC = "market-events"
+REDIS_RETRY_INITIAL_SECONDS = 0.1
+REDIS_RETRY_MAX_SECONDS = 5.0
 
 
 @dataclass(frozen=True)
@@ -176,9 +178,17 @@ class DistributionEngine:
     Fanout to WebSocket clients will be added in the next step.
     """
 
-    def __init__(self):
+    def __init__(
+        self,
+        redis_retry_initial: float = REDIS_RETRY_INITIAL_SECONDS,
+        redis_retry_max: float = REDIS_RETRY_MAX_SECONDS,
+    ):
         self.consumer = KafkaConsumerBridge()
         self._processed = 0
+        self._redis_retries = 0
+        self._shutdown = asyncio.Event()
+        self._redis_retry_initial = redis_retry_initial
+        self._redis_retry_max = redis_retry_max
 
     async def process_event(self, event: MarketEvent, snapshot_store: SnapshotStore):
         await snapshot_store.update(event)
@@ -189,9 +199,37 @@ class DistributionEngine:
         self,
         consumed: ConsumedEvent,
         snapshot_store: SnapshotStore,
-    ) -> None:
-        await self.process_event(consumed.event, snapshot_store)
-        self.consumer.acknowledge(consumed)
+    ) -> bool:
+        backoff = self._redis_retry_initial
+        while not self._shutdown.is_set():
+            try:
+                # Retrying may repeat update and publish after an ambiguous
+                # failure. Snapshot writes are idempotent; replayed Pub/Sub
+                # events are rejected downstream by per-symbol sequence state.
+                await self.process_event(consumed.event, snapshot_store)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                self._redis_retries += 1
+                logger.warning(
+                    "Redis processing failed for %s[%d]@%d: %s; "
+                    "retrying in %.1fs",
+                    consumed.topic,
+                    consumed.partition,
+                    consumed.offset,
+                    exc,
+                    backoff,
+                )
+                try:
+                    await asyncio.wait_for(self._shutdown.wait(), timeout=backoff)
+                except asyncio.TimeoutError:
+                    backoff = min(backoff * 2, self._redis_retry_max)
+                continue
+
+            self.consumer.acknowledge(consumed)
+            return True
+
+        return False
 
     async def run(self):
         loop = asyncio.get_running_loop()
@@ -201,7 +239,8 @@ class DistributionEngine:
 
         try:
             async for consumed in self.consumer.events():
-                await self.process_consumed_event(consumed, snapshot_store)
+                if not await self.process_consumed_event(consumed, snapshot_store):
+                    break
 
                 if self._processed % 500 == 0:
                     logger.info(
@@ -213,6 +252,7 @@ class DistributionEngine:
             await snapshot_store.close()
 
     async def shutdown(self):
+        self._shutdown.set()
         self.consumer.stop()
 
 

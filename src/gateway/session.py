@@ -68,6 +68,10 @@ class LatencyTracker:
     def sample_count(self) -> int:
         return len(self._samples)
 
+    @property
+    def samples(self) -> tuple[float, ...]:
+        return tuple(self._samples)
+
 
 @dataclass
 class ClientStats:
@@ -235,10 +239,6 @@ class ClientSession:
                 except asyncio.TimeoutError:
                     continue
 
-                event_ts = message.get("event_ts")
-                if event_ts:
-                    self.stats.latency.record(event_ts)
-
                 try:
                     if self.encoding == Encoding.MSGPACK:
                         await self.websocket.send_bytes(
@@ -247,6 +247,9 @@ class ClientSession:
                     else:
                         await self.websocket.send_text(json.dumps(message))
                     self.stats.sent += 1
+                    event_ts = message.get("event_ts")
+                    if event_ts:
+                        self.stats.latency.record(event_ts)
                 except Exception as e:
                     logger.info(f"[{self.client_id}] Send failed: {e}")
                     self._disconnected.set()

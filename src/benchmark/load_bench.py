@@ -1,11 +1,12 @@
 """
-Load benchmark: measures p50/p99 dispatch latency under N concurrent clients.
+Load benchmark: validates delivery and measures client-observed p50/p99 latency.
 
 Tests:
   - 1, 5, 10, 20 concurrent clients
   - Each client subscribes to AAPL and TSLA
   - Runs for 15 seconds per scenario
-  - Reports p50/p99 latency and throughput from /metrics/summary
+  - Receives and decodes every frame, tracking sequence regressions and errors
+  - Computes p50/p99 from combined client-observed receive-latency samples
 
 Run:
   python3 -m src.benchmark.load_bench
@@ -13,6 +14,7 @@ Run:
 
 import asyncio
 import json
+import math
 import time
 import websockets
 import aiohttp
@@ -34,17 +36,66 @@ class ScenarioResult:
     total_dropped: int
     throughput_eps: float
     duration_sec: float
+    received: int
+    malformed: int
+    sequence_regressions: int
+    client_errors: list[str]
+
+
+@dataclass
+class ClientResult:
+    client_id: int
+    received: int
+    malformed: int
+    sequence_regressions: int
+    latencies_ms: list[float]
+    error: str | None = None
+
+
+def percentile(values: list[float], p: float) -> float:
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    index = min(int(len(ordered) * p / 100), len(ordered) - 1)
+    return round(ordered[index], 2)
 
 
 async def run_client(client_id: int, duration: float):
     """Single client: subscribe and receive for `duration` seconds."""
+    result = ClientResult(client_id, 0, 0, 0, [])
+    deadline = asyncio.get_running_loop().time() + duration
+    last_seq: dict[str, int] = {}
     try:
         async with websockets.connect(GATEWAY_WS) as ws:
             for symbol in SYMBOLS:
                 await ws.send(json.dumps({"action": "subscribe", "symbol": symbol}))
-            await asyncio.sleep(duration)
+            while True:
+                remaining = deadline - asyncio.get_running_loop().time()
+                if remaining <= 0:
+                    break
+                try:
+                    raw = await asyncio.wait_for(ws.recv(), timeout=remaining)
+                except asyncio.TimeoutError:
+                    break
+                try:
+                    message = json.loads(raw)
+                    symbol = message.get("symbol")
+                    seq = int(message["seq"])
+                    previous = last_seq.get(symbol)
+                    if previous is not None and seq < previous:
+                        result.sequence_regressions += 1
+                    last_seq[symbol] = max(seq, previous or seq)
+                    event_ts = message.get("event_ts")
+                    if event_ts is not None:
+                        latency = time.time() * 1000 - int(event_ts)
+                        if math.isfinite(latency):
+                            result.latencies_ms.append(latency)
+                    result.received += 1
+                except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+                    result.malformed += 1
     except Exception as e:
-        pass  # Client disconnect is expected at end of test
+        result.error = f"client {client_id}: {type(e).__name__}: {e}"
+    return result
 
 
 async def run_scenario(n_clients: int) -> ScenarioResult:
@@ -69,16 +120,39 @@ async def run_scenario(n_clients: int) -> ScenarioResult:
             metrics = {}
 
         # Wait for clients to finish
-        await asyncio.gather(*client_tasks, return_exceptions=True)
+        client_results = await asyncio.gather(*client_tasks)
+
+    errors = [result.error for result in client_results if result.error]
+    empty_clients = [
+        str(result.client_id) for result in client_results if result.received == 0
+    ]
+    if empty_clients:
+        errors.append(f"clients received no frames: {', '.join(empty_clients)}")
+    malformed = sum(result.malformed for result in client_results)
+    regressions = sum(result.sequence_regressions for result in client_results)
+    if malformed:
+        errors.append(f"malformed frames: {malformed}")
+    if regressions:
+        errors.append(f"sequence regressions: {regressions}")
+
+    latencies = [
+        latency
+        for result in client_results
+        for latency in result.latencies_ms
+    ]
 
     return ScenarioResult(
         n_clients=n_clients,
-        p50_ms=metrics.get("avg_p50_ms", 0),
-        p99_ms=metrics.get("avg_p99_ms", 0),
+        p50_ms=percentile(latencies, 50),
+        p99_ms=percentile(latencies, 99),
         total_sent=metrics.get("total_sent", 0),
         total_dropped=metrics.get("total_dropped", 0),
-        throughput_eps=0,
+        throughput_eps=round(sum(r.received for r in client_results) / DURATION_SEC, 1),
         duration_sec=DURATION_SEC,
+        received=sum(r.received for r in client_results),
+        malformed=malformed,
+        sequence_regressions=regressions,
+        client_errors=errors,
     )
 
 
@@ -86,8 +160,10 @@ def print_result(r: ScenarioResult):
     print(f"  Clients: {r.n_clients:>3} | "
           f"p50: {r.p50_ms:>6.2f}ms | "
           f"p99: {r.p99_ms:>6.2f}ms | "
-          f"sent: {r.total_sent:>6} | "
-          f"dropped: {r.total_dropped}")
+          f"received: {r.received:>6} | "
+          f"dropped: {r.total_dropped} | errors: {len(r.client_errors)}")
+    for error in r.client_errors:
+        print(f"    ERROR: {error}")
 
 
 async def main():
@@ -105,6 +181,11 @@ async def main():
         result = await run_scenario(n)
         print_result(result)
         results.append(result)
+        if result.client_errors:
+            raise RuntimeError(
+                f"Scenario with {n} clients is invalid: "
+                + "; ".join(result.client_errors)
+            )
         await asyncio.sleep(3)  # cool-down between scenarios
 
     # Summary table

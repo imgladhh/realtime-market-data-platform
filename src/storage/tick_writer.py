@@ -79,7 +79,9 @@ class TickWriter:
 
         try:
             while not self._stop:
-                msg = consumer.poll(timeout=0.05)
+                msg = consumer.poll(
+                    timeout=self._poll_timeout(batch, batch_started)
+                )
                 if msg is None:
                     if batch and self._batch_expired(batch_started):
                         await self._flush(batch, consumer)
@@ -109,7 +111,7 @@ class TickWriter:
                     offset=msg.offset(),
                 ))
 
-                if len(batch) >= self.batch_max_size:
+                if self._should_flush(batch, batch_started):
                     await self._flush(batch, consumer)
                     batch = []
 
@@ -122,6 +124,27 @@ class TickWriter:
     def _batch_expired(self, batch_started: float) -> bool:
         elapsed_ms = (time.monotonic() - batch_started) * 1000
         return elapsed_ms >= self.batch_max_latency_ms
+
+    def _should_flush(
+        self,
+        batch: list[ConsumedTick],
+        batch_started: float,
+    ) -> bool:
+        return (
+            len(batch) >= self.batch_max_size
+            or self._batch_expired(batch_started)
+        )
+
+    def _poll_timeout(
+        self,
+        batch: list[ConsumedTick],
+        batch_started: float,
+    ) -> float:
+        if not batch:
+            return 0.05
+        elapsed = time.monotonic() - batch_started
+        remaining = max(self.batch_max_latency_ms / 1000.0 - elapsed, 0.0)
+        return min(0.05, remaining)
 
     async def _ensure_schema_with_retry(self):
         backoff = 0.1

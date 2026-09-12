@@ -211,7 +211,7 @@ The fanout loop never blocks — it only calls `queue.put_nowait()`. If the queu
 | `DISCONNECT` | Disconnect client after N drops | When data completeness matters |
 
 **LatencyTracker:**
-Records end-to-end dispatch latency (`now - event_ts`) for every sent message. Maintains a rolling window of 1000 samples for computing p50/p99 on demand.
+Records end-to-end dispatch latency (`now - event_ts`) only after a WebSocket send completes successfully. Maintains a rolling window of 1000 samples for computing p50/p99 on demand.
 
 **Independent WriterLoop:**
 Each session runs its own `asyncio.Task` that drains the queue and writes to the WebSocket. This is why a slow client never affects others — each client's write loop is completely independent.
@@ -419,6 +419,11 @@ tests/
 
 ### Dispatch Latency (load benchmark)
 
+The historical figures below are stale pending a rerun of the validating load
+client. The current benchmark actively receives and decodes every frame, reports
+empty clients, malformed frames, disconnects and sequence regressions, and
+computes percentiles from the combined client receive-latency samples.
+
 50 events/sec per symbol, 2 symbols (AAPL + TSLA), 15s per scenario:
 
 | Clients | p50 (ms) | p99 (ms) | Total Sent | Dropped |
@@ -428,7 +433,10 @@ tests/
 | 10      | 7.99     | 9.54     | 12,838     | 0       |
 | 20      | 8.38     | 10.22    | 25,687     | 0       |
 
-**Key insight:** p99 latency remains stable (~10ms) from 1 to 20 clients with zero drops. This validates the per-client queue isolation design — fanout does not degrade as client count grows. See `benchmark/results.md` for full output.
+**Historical observation (not current evidence):** the previous run reported stable
+~10ms p99 latency from 1 to 20 clients with zero server-side queue drops. Rerun
+the validating benchmark before using those values as evidence. See
+`benchmark/results.md` for the retained output and its limitations.
 
 ### Serialization Benchmark (100,000 iterations)
 

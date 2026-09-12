@@ -1,6 +1,7 @@
 import asyncio
 import json
 import msgpack
+import time
 import pytest
 from src.gateway.session import (
     ClientSession,
@@ -299,6 +300,29 @@ class TestWriterLoop:
 
         assert session.stats.latency.sample_count == 1
         assert session.stats.latency.p50 >= 10
+
+    @pytest.mark.asyncio
+    async def test_writer_records_latency_only_after_send_completes(self):
+        session = make_session(queue_size=10)
+        send_started = asyncio.Event()
+        release_send = asyncio.Event()
+
+        async def blocked_send(message):
+            send_started.set()
+            await release_send.wait()
+
+        session.websocket.send_text = blocked_send
+        session.start_writer()
+        event_ts = int(time.time() * 1000) - 10
+        session.enqueue({"symbol": "AAPL", "seq": 1, "event_ts": event_ts})
+
+        await send_started.wait()
+        assert session.stats.latency.sample_count == 0
+
+        release_send.set()
+        await asyncio.sleep(0)
+        assert session.stats.latency.sample_count == 1
+        await session.close()
 
     @pytest.mark.asyncio
     async def test_disconnect_stops_writer(self):

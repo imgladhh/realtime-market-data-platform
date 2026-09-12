@@ -13,14 +13,18 @@ class FakeSnapshotStore:
         self.published = []
         self.fail_update = fail_update
         self.fail_publish = fail_publish
+        self.update_failures = 0
+        self.publish_failures = 0
 
     async def update(self, event):
-        if self.fail_update:
+        if self.fail_update or self.update_failures > 0:
+            self.update_failures -= 1
             raise RuntimeError("snapshot failed")
         self.updated.append(event)
 
     async def publish_event(self, event):
-        if self.fail_publish:
+        if self.fail_publish or self.publish_failures > 0:
+            self.publish_failures -= 1
             raise RuntimeError("publish failed")
         self.published.append(event)
         return 1
@@ -32,6 +36,9 @@ class FakeBridge:
 
     def acknowledge(self, consumed):
         self.acknowledged.append(consumed)
+
+    def stop(self):
+        pass
 
 
 def consumed_event(seq=10):
@@ -73,17 +80,38 @@ async def test_consumed_event_acknowledged_after_update_and_publish():
 @pytest.mark.asyncio
 @pytest.mark.parametrize("failure", ["update", "publish"])
 async def test_redis_failure_does_not_acknowledge(failure):
-    engine = DistributionEngine()
+    engine = DistributionEngine(redis_retry_initial=0.01, redis_retry_max=0.01)
     engine.consumer = FakeBridge()
     store = FakeSnapshotStore(
         fail_update=failure == "update",
         fail_publish=failure == "publish",
     )
 
-    with pytest.raises(RuntimeError):
-        await engine.process_consumed_event(consumed_event(), store)
+    task = asyncio.create_task(engine.process_consumed_event(consumed_event(), store))
+    while engine._redis_retries == 0:
+        await asyncio.sleep(0)
+    await engine.shutdown()
 
+    assert await task is False
     assert engine.consumer.acknowledged == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["update", "publish"])
+async def test_transient_redis_failure_retries_then_acknowledges(failure):
+    engine = DistributionEngine(redis_retry_initial=0, redis_retry_max=0)
+    engine.consumer = FakeBridge()
+    store = FakeSnapshotStore()
+    if failure == "update":
+        store.update_failures = 1
+    else:
+        store.publish_failures = 1
+    consumed = consumed_event()
+
+    assert await engine.process_consumed_event(consumed, store) is True
+
+    assert engine._redis_retries == 1
+    assert engine.consumer.acknowledged == [consumed]
 
 
 def test_gateway_engine_disables_auto_commit():
