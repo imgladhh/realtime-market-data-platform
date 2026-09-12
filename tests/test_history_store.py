@@ -109,6 +109,19 @@ async def test_fetch_ticks_caps_limit():
     assert conn.fetch_calls[0][4] == MAX_HISTORY_LIMIT
 
 
+@pytest.mark.asyncio
+async def test_fetch_ticks_does_not_wrap_query_timeout_as_unavailable():
+    class TimeoutConn(FakeConn):
+        async def fetch(self, *args):
+            raise asyncio.TimeoutError()
+
+    store = HistoryStore()
+    store._pool = FakePool(TimeoutConn())
+
+    with pytest.raises(asyncio.TimeoutError):
+        await store.fetch_ticks("AAPL", 1, 2)
+
+
 def test_event_to_row_derives_event_time_from_event_ts():
     event = make_event(symbol="AAPL", seq=1)
 

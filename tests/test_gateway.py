@@ -8,6 +8,7 @@ from src.gateway import gateway
 from src.gateway.aggregator import AggregationBuffer, AggregationMode
 from src.gateway.session import ClientSession, Encoding, SlowConsumerPolicy
 from src.models import SnapshotData
+from src.storage.history_store import HistoryStore
 from tests.conftest import make_event, make_websocket
 
 
@@ -800,11 +801,24 @@ async def test_history_no_ticks_returns_404(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_history_query_timeout_returns_504(monkeypatch):
-    monkeypatch.setattr(
-        gateway,
-        "history_store",
-        FakeHistoryStore(exc=asyncio.TimeoutError()),
-    )
+    class TimeoutConnection:
+        async def fetch(self, *args):
+            raise asyncio.TimeoutError()
+
+    class AcquireTimeoutConnection:
+        async def __aenter__(self):
+            return TimeoutConnection()
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+    class TimeoutPool:
+        def acquire(self):
+            return AcquireTimeoutConnection()
+
+    store = HistoryStore()
+    store._pool = TimeoutPool()
+    monkeypatch.setattr(gateway, "history_store", store)
 
     response = await gateway.get_history("AAPL", from_ts="1", to_ts="2")
 

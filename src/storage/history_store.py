@@ -17,7 +17,11 @@ class HistoryStoreUnavailableError(RuntimeError):
 
 
 def _is_unavailable_error(exc: Exception) -> bool:
-    if isinstance(exc, (ConnectionError, OSError, TimeoutError, asyncio.TimeoutError)):
+    # TimeoutError is an OSError subclass, but query timeouts have their own
+    # gateway contract (504) and must remain distinguishable from DB outages.
+    if isinstance(exc, (TimeoutError, asyncio.TimeoutError)):
+        return False
+    if isinstance(exc, (ConnectionError, OSError)):
         return True
     return type(exc).__name__ in {
         "CannotConnectNowError",
