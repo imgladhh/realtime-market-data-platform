@@ -18,7 +18,7 @@ class MarketEvent:
     ask_size: int
     event_ts: int           # upstream timestamp (ms)
     server_ts: int          # ingestion timestamp (ms)
-    seq: int                # global monotonic sequence number
+    seq: int                # monotonic sequence number within symbol
     type: EventType = EventType.QUOTE
     last_price: float = 0.0
     last_size: int = 0

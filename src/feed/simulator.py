@@ -33,7 +33,10 @@ class FeedSimulator:
     def __init__(self, bootstrap_servers: str = "localhost:9092"):
         self.producer = make_producer(bootstrap_servers)
         self.prices = {s: p for s, p in INITIAL_PRICES.items()}
-        self._seq = itertools.count(1)   # global sequence counter
+        self._seq = {
+            symbol: itertools.count(1)
+            for symbol in INITIAL_PRICES
+        }
 
     def _next_price(self, symbol: str) -> tuple[float, float]:
         """Random walk: price moves ±0.05%, spread is 0.02%."""
@@ -57,7 +60,7 @@ class FeedSimulator:
             ask_size=random.randint(100, 1000),
             event_ts=now,
             server_ts=now,
-            seq=next(self._seq),
+            seq=next(self._seq[symbol]),
             type=EventType.QUOTE,
         )
 

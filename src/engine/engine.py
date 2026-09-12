@@ -1,13 +1,24 @@
 import asyncio
+import concurrent.futures
 import json
 import logging
+import queue
 import threading
+from dataclasses import dataclass
 from src.models import MarketEvent, EventType
 from src.engine.snapshot_store import SnapshotStore
 
 logger = logging.getLogger(__name__)
 
 KAFKA_TOPIC = "market-events"
+
+
+@dataclass(frozen=True)
+class ConsumedEvent:
+    event: MarketEvent
+    topic: str
+    partition: int
+    offset: int
 
 
 class KafkaConsumerBridge:
@@ -25,9 +36,10 @@ class KafkaConsumerBridge:
             "bootstrap.servers": bootstrap_servers,
             "group.id": group_id,
             "auto.offset.reset": "latest",
-            "enable.auto.commit": True,
+            "enable.auto.commit": False,
         }
-        self._queue: asyncio.Queue[MarketEvent] = asyncio.Queue(maxsize=10000)
+        self._queue: asyncio.Queue[ConsumedEvent] = asyncio.Queue(maxsize=10000)
+        self._acknowledgements: queue.SimpleQueue[ConsumedEvent] = queue.SimpleQueue()
         self._loop: asyncio.AbstractEventLoop | None = None
         self._thread: threading.Thread | None = None
         self._stop_event = threading.Event()
@@ -50,34 +62,97 @@ class KafkaConsumerBridge:
             logger.error(f"Failed to parse event: {e} | raw={raw}")
             return None
 
+    def _handoff(self, consumed: ConsumedEvent) -> bool:
+        if self._loop is None:
+            return False
+
+        future = asyncio.run_coroutine_threadsafe(
+            self._queue.put(consumed),
+            self._loop,
+        )
+        while not self._stop_event.is_set():
+            try:
+                future.result(timeout=0.1)
+                return True
+            except concurrent.futures.TimeoutError:
+                continue
+            except (concurrent.futures.CancelledError, RuntimeError) as exc:
+                logger.warning("Kafka handoff failed: %s", exc)
+                return False
+
+        future.cancel()
+        return False
+
+    def acknowledge(self, consumed: ConsumedEvent) -> None:
+        self._acknowledgements.put(consumed)
+
+    def _drain_acknowledgements(self, consumer, topic_partition_factory) -> None:
+        while True:
+            try:
+                consumed = self._acknowledgements.get_nowait()
+            except queue.Empty:
+                return
+
+            try:
+                consumer.commit(
+                    offsets=[
+                        topic_partition_factory(
+                            consumed.topic,
+                            consumed.partition,
+                            consumed.offset + 1,
+                        )
+                    ],
+                    asynchronous=False,
+                )
+            except Exception as exc:
+                # Downstream work already succeeded. A failed commit is safe:
+                # Kafka may replay the event and Redis updates are idempotent.
+                logger.warning(
+                    "Failed to commit Kafka offset %s[%d]@%d: %s",
+                    consumed.topic,
+                    consumed.partition,
+                    consumed.offset,
+                    exc,
+                )
+
     def _consume_loop(self):
-        from confluent_kafka import Consumer, KafkaError
+        from confluent_kafka import Consumer, KafkaError, TopicPartition
 
         consumer = Consumer(self._config)
         consumer.subscribe([KAFKA_TOPIC])
         logger.info(f"Kafka consumer started, topic={KAFKA_TOPIC}")
 
-        while not self._stop_event.is_set():
-            msg = consumer.poll(timeout=0.1)
-            if msg is None:
-                continue
-            if msg.error():
-                if msg.error().code() != KafkaError._PARTITION_EOF:
-                    logger.error(f"Kafka error: {msg.error()}")
-                continue
+        try:
+            while not self._stop_event.is_set():
+                self._drain_acknowledgements(consumer, TopicPartition)
+                msg = consumer.poll(timeout=0.1)
+                if msg is None:
+                    continue
+                if msg.error():
+                    if msg.error().code() != KafkaError._PARTITION_EOF:
+                        logger.error(f"Kafka error: {msg.error()}")
+                    continue
 
-            event = self._parse_event(msg.value())
-            if event and self._loop:
-                # Thread-safe bridge into asyncio event loop
-                asyncio.run_coroutine_threadsafe(
-                    self._queue.put(event), self._loop
+                event = self._parse_event(msg.value())
+                if event is None:
+                    continue
+
+                consumed = ConsumedEvent(
+                    event=event,
+                    topic=msg.topic(),
+                    partition=msg.partition(),
+                    offset=msg.offset(),
                 )
-
-        consumer.close()
-        logger.info("Kafka consumer stopped")
+                if not self._handoff(consumed):
+                    break
+        finally:
+            self._drain_acknowledgements(consumer, TopicPartition)
+            consumer.close()
+            logger.info("Kafka consumer stopped")
 
     def start(self, loop: asyncio.AbstractEventLoop):
         self._loop = loop
+        self._stop_event.clear()
         self._thread = threading.Thread(
             target=self._consume_loop, daemon=True, name="kafka-consumer"
         )
@@ -85,12 +160,14 @@ class KafkaConsumerBridge:
 
     def stop(self):
         self._stop_event.set()
+        if self._thread and self._thread is not threading.current_thread():
+            self._thread.join(timeout=2.0)
 
     async def events(self):
-        """Async generator: yields MarketEvents as they arrive."""
+        """Async generator: yields Kafka events and acknowledgement metadata."""
         while True:
-            event = await self._queue.get()
-            yield event
+            consumed = await self._queue.get()
+            yield consumed
 
 
 class DistributionEngine:
@@ -108,6 +185,14 @@ class DistributionEngine:
         await snapshot_store.publish_event(event)
         self._processed += 1
 
+    async def process_consumed_event(
+        self,
+        consumed: ConsumedEvent,
+        snapshot_store: SnapshotStore,
+    ) -> None:
+        await self.process_event(consumed.event, snapshot_store)
+        self.consumer.acknowledge(consumed)
+
     async def run(self):
         loop = asyncio.get_running_loop()
         self.consumer.start(loop)
@@ -115,15 +200,16 @@ class DistributionEngine:
         logger.info("DistributionEngine running...")
 
         try:
-            async for event in self.consumer.events():
-                await self.process_event(event, snapshot_store)
+            async for consumed in self.consumer.events():
+                await self.process_consumed_event(consumed, snapshot_store)
 
                 if self._processed % 500 == 0:
                     logger.info(
                         f"Processed {self._processed} events | "
-                        f"last={event.symbol} seq={event.seq}"
+                        f"last={consumed.event.symbol} seq={consumed.event.seq}"
                     )
         finally:
+            self.consumer.stop()
             await snapshot_store.close()
 
     async def shutdown(self):

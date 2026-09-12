@@ -12,6 +12,7 @@ from src.engine.snapshot_store import SnapshotStore
 from src.gateway.session import (
     ClientSession,
     Encoding,
+    SequenceDecision,
     SlowConsumerPolicy,
     SubscriptionFilter,
 )
@@ -201,11 +202,22 @@ async def client_dispatch_loop(session: ClientSession):
         async for event in session.aggregator.events():
             symbol = event.symbol
 
-            # Gap detection: RAW mode only
-            if is_raw and session.check_gap(symbol, event.seq):
+            sequence_decision = session.classify_sequence(
+                symbol,
+                event.seq,
+                detect_gap=is_raw,
+            )
+            if sequence_decision == SequenceDecision.STALE:
+                continue
+
+            if sequence_decision == SequenceDecision.GAP:
                 snapshot = await snapshot_store.get(symbol)
-                if snapshot:
-                    session.enqueue({"type": "snapshot", **snapshot.to_dict()})
+                previous_seq = session.last_seq.get(symbol)
+                if (
+                    snapshot
+                    and (previous_seq is None or snapshot.seq > previous_seq)
+                    and session.enqueue({"type": "snapshot", **snapshot.to_dict()})
+                ):
                     session.last_seq[symbol] = snapshot.seq
                     session.last_price[symbol] = snapshot.bid
                 continue

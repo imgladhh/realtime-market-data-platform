@@ -5,6 +5,7 @@ import pytest
 from src.gateway.session import (
     ClientSession,
     Encoding,
+    SequenceDecision,
     SlowConsumerPolicy,
     SubscriptionFilter,
 )
@@ -78,33 +79,46 @@ class TestDropOldest:
 
 class TestGapDetection:
 
-    def test_no_gap_on_first_message(self):
+    def test_next_on_first_message(self):
         session = make_session()
-        session.last_seq["AAPL"] = 100
-        assert session.check_gap("AAPL", 101) is False
+        assert session.classify_sequence("AAPL", 1) == SequenceDecision.NEXT
+        assert session.last_seq["AAPL"] == 1
 
-    def test_no_gap_within_tolerance(self):
+    def test_next_sequence_advances_baseline(self):
         session = make_session()
         session.last_seq["AAPL"] = 100
-        assert session.check_gap("AAPL", 105) is False
+        assert session.classify_sequence("AAPL", 101) == SequenceDecision.NEXT
+        assert session.last_seq["AAPL"] == 101
 
-    def test_gap_detected_beyond_tolerance(self):
+    def test_gap_detected_when_next_symbol_sequence_is_missing(self):
         session = make_session()
         session.last_seq["AAPL"] = 100
-        assert session.check_gap("AAPL", 106) is True
+        assert session.classify_sequence("AAPL", 102) == SequenceDecision.GAP
         assert session.stats.gaps_detected == 1
+        assert session.last_seq["AAPL"] == 100
 
-    def test_gap_updates_last_seq(self):
+    def test_duplicate_event_does_not_regress_sequence(self):
         session = make_session()
         session.last_seq["AAPL"] = 100
-        session.check_gap("AAPL", 200)
-        assert session.last_seq["AAPL"] == 200
+        assert session.classify_sequence("AAPL", 100) == SequenceDecision.STALE
+        assert session.last_seq["AAPL"] == 100
 
-    def test_no_gap_when_symbol_unseen(self):
+    def test_older_event_does_not_regress_sequence(self):
         session = make_session()
-        result = session.check_gap("AAPL", 500)
-        assert result is False
-        assert session.last_seq["AAPL"] == 500
+        session.last_seq["AAPL"] = 100
+        assert session.classify_sequence("AAPL", 99) == SequenceDecision.STALE
+        assert session.last_seq["AAPL"] == 100
+
+    def test_aggregated_mode_accepts_forward_jump_but_rejects_stale(self):
+        session = make_session()
+        session.last_seq["AAPL"] = 100
+        assert session.classify_sequence(
+            "AAPL", 110, detect_gap=False
+        ) == SequenceDecision.NEXT
+        assert session.classify_sequence(
+            "AAPL", 109, detect_gap=False
+        ) == SequenceDecision.STALE
+        assert session.last_seq["AAPL"] == 110
 
 
 # ── Writer loop ───────────────────────────────────────────────────────────────

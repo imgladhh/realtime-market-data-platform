@@ -115,7 +115,7 @@ bid          = mid - spread/2
 ask          = mid + spread/2
 ```
 
-Each event is assigned a **global monotonically increasing sequence number** before being produced to Kafka. The Kafka `key` is set to the symbol, which determines which partition the message lands in.
+Each event is assigned a **monotonically increasing sequence number within its symbol** before being produced to Kafka. The Kafka `key` is set to the symbol, which determines which partition the message lands in. Sequence numbers do not define ordering across different symbols.
 
 Supported symbols: `AAPL`, `TSLA`, `GOOGL`, `MSFT`, `BTCUSD`
 
@@ -152,15 +152,18 @@ This is the most technically nuanced component.
 ```
 Thread (blocking Kafka poll loop)
     │
-    │  asyncio.run_coroutine_threadsafe(queue.put(event), loop)
+    │  asyncio.run_coroutine_threadsafe(queue.put(envelope), loop)
+    │  polling pauses while the bounded handoff is full
     ▼
 asyncio event loop (non-blocking queue.get())
     │
+    │  Redis snapshot update + Pub/Sub publish
+    │  success ACK
     ▼
-FanoutDispatcher
+Kafka thread commits the acknowledged offset
 ```
 
-The consumer runs in a dedicated daemon thread. Events are bridged into the asyncio event loop via `asyncio.run_coroutine_threadsafe`, which is the only thread-safe way to schedule a coroutine from outside the event loop.
+The consumer runs in a dedicated daemon thread. Events and Kafka offset metadata are bridged into the asyncio event loop via `asyncio.run_coroutine_threadsafe`. Auto-commit is disabled: the asyncio processor acknowledges an envelope only after both Redis operations succeed, and the consumer thread commits that explicit offset. Waiting for bounded queue capacity prevents unbounded pending handoffs.
 
 ---
 
@@ -446,7 +449,7 @@ tests/
 | Slow consumer (queue full) | Drop oldest message — in market data, latest value supersedes history |
 | Persistent slow consumer | Disconnect after N accumulated drops (configurable threshold) |
 | Client reconnect | Re-subscribe flow: fresh snapshot + seq realignment |
-| Seq gap detected | Client detects jump > 5 in seq → re-subscribes for fresh snapshot |
+| Seq gap detected | RAW client does not receive the next per-symbol seq → fetches a fresh snapshot |
 | Kafka consumer lag | Internal bridge queue bounded at 10,000 events |
 | Redis restart | AOF persistence restores snapshot data on startup |
 | Feed simulator crash | Kafka retains event log; engine resumes from last offset on restart |

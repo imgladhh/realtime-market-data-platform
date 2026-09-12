@@ -3,6 +3,7 @@ import json
 import logging
 import os
 import time
+from dataclasses import dataclass
 
 from src.models import EventType, MarketEvent
 from src.storage.history_store import HistoryStore
@@ -13,6 +14,15 @@ KAFKA_TOPIC = "market-events"
 BATCH_MAX_SIZE = 500
 BATCH_MAX_LATENCY_MS = 100
 MAX_BACKOFF_SECONDS = 5.0
+
+
+@dataclass(frozen=True)
+class ConsumedTick:
+    event: MarketEvent
+    message: object
+    topic: str
+    partition: int
+    offset: int
 
 
 class TickWriter:
@@ -64,7 +74,7 @@ class TickWriter:
         await self._ensure_schema_with_retry()
         consumer = Consumer(self._config)
         consumer.subscribe([KAFKA_TOPIC])
-        batch: list[MarketEvent] = []
+        batch: list[ConsumedTick] = []
         batch_started = time.monotonic()
 
         try:
@@ -84,12 +94,20 @@ class TickWriter:
 
                 event = self._parse_event(msg.value())
                 if event is None:
-                    consumer.commit(message=msg, asynchronous=False)
+                    if not await self._handle_invalid_message(batch, msg, consumer):
+                        break
+                    batch = []
                     continue
 
                 if not batch:
                     batch_started = time.monotonic()
-                batch.append(event)
+                batch.append(ConsumedTick(
+                    event=event,
+                    message=msg,
+                    topic=msg.topic(),
+                    partition=msg.partition(),
+                    offset=msg.offset(),
+                ))
 
                 if len(batch) >= self.batch_max_size:
                     await self._flush(batch, consumer)
@@ -120,16 +138,44 @@ class TickWriter:
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, MAX_BACKOFF_SECONDS)
 
-    async def _flush(self, batch: list[MarketEvent], consumer):
+    async def _handle_invalid_message(self, batch, message, consumer) -> bool:
+        if batch:
+            # Persist and explicitly commit earlier valid records before
+            # advancing this partition past the malformed message.
+            if not await self._flush(batch, consumer):
+                return False
+
+        consumer.commit(message=message, asynchronous=False)
+        return True
+
+    @staticmethod
+    def _commit_batch(batch: list[ConsumedTick], consumer) -> None:
+        last_by_partition: dict[tuple[str, int], ConsumedTick] = {}
+        for consumed in batch:
+            key = (consumed.topic, consumed.partition)
+            previous = last_by_partition.get(key)
+            if previous is None or consumed.offset > previous.offset:
+                last_by_partition[key] = consumed
+
+        for consumed in last_by_partition.values():
+            consumer.commit(message=consumed.message, asynchronous=False)
+
+    async def _flush(self, batch: list[ConsumedTick], consumer) -> bool:
         backoff = 0.1
         while not self._stop:
             try:
-                inserted = await self.store.insert_ticks(batch)
+                inserted = await self.store.insert_ticks(
+                    [consumed.event for consumed in batch]
+                )
             except (TimeoutError, asyncio.TimeoutError):
-                self.dropped_ticks += len(batch)
-                logger.error("Timed out writing %d ticks; dropping batch", len(batch))
-                consumer.commit(asynchronous=False)
-                return
+                logger.warning(
+                    "Timed out writing %d ticks; retrying in %.1fs",
+                    len(batch),
+                    backoff,
+                )
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, MAX_BACKOFF_SECONDS)
+                continue
             except Exception as exc:
                 logger.warning(
                     "Failed to write %d ticks: %s; retrying in %.1fs",
@@ -142,8 +188,10 @@ class TickWriter:
                 continue
 
             self.inserted_ticks += inserted
-            consumer.commit(asynchronous=False)
-            return
+            self._commit_batch(batch, consumer)
+            return True
+
+        return False
 
 
 if __name__ == "__main__":

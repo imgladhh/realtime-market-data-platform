@@ -96,10 +96,10 @@ ws://localhost:8000/stream
 Every tick delivered immediately. Lowest latency.
 
 ```
-type=snapshot seq=188381 bid=207.37
-type=quote    seq=188401 bid=207.91   ← ~20 seq gap = ~100ms, 5 symbols
-type=quote    seq=188426 bid=207.88
-type=quote    seq=188451 bid=207.65
+type=snapshot seq=381 bid=207.37
+type=quote    seq=382 bid=207.91
+type=quote    seq=383 bid=207.88
+type=quote    seq=384 bid=207.65
 ...
 ```
 
@@ -110,9 +110,9 @@ ws://localhost:8000/stream?mode=agg_100ms
 Events buffered per symbol in 100ms windows. Only latest event per symbol per window is emitted.
 
 ```
-type=snapshot seq=188381 bid=207.37
-type=quote    seq=188401 bid=207.91   ← only latest AAPL in each 100ms window
-type=quote    seq=188426 bid=207.88
+type=snapshot seq=381 bid=207.37
+type=quote    seq=386 bid=207.91   ← only latest AAPL in each 100ms window
+type=quote    seq=391 bid=207.88
 ...
 ```
 

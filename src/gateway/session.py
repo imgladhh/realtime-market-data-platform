@@ -25,6 +25,12 @@ class Encoding(str, Enum):
     MSGPACK = "msgpack"
 
 
+class SequenceDecision(str, Enum):
+    NEXT  = "next"
+    GAP   = "gap"
+    STALE = "stale"
+
+
 @dataclass
 class SubscriptionFilter:
     min_change_pct: float | None = None
@@ -122,28 +128,37 @@ class ClientSession:
 
     # ── Gap detection ─────────────────────────────────────────────────────────
 
-    def check_gap(self, symbol: str, seq: int) -> bool:
+    def classify_sequence(
+        self,
+        symbol: str,
+        seq: int,
+        *,
+        detect_gap: bool = True,
+    ) -> SequenceDecision:
         """
-        Returns True if a seq gap is detected (missed messages).
-        Tolerance of 5 accounts for minor reordering within a burst.
+        Classify an event against the last accepted per-symbol sequence.
 
-        Only called in RAW mode. In AGG_100MS mode, seq jumps are
-        expected (intermediate events are intentionally skipped).
+        RAW mode enables gap detection and expects seq=last+1.
+        Aggregated mode accepts forward jumps but still rejects stale events.
         """
         last = self.last_seq.get(symbol)
         if last is None:
             self.last_seq[symbol] = seq
-            return False
+            return SequenceDecision.NEXT
 
-        gap = seq > last + 5
-        if gap:
+        if seq <= last:
+            return SequenceDecision.STALE
+
+        if detect_gap and seq != last + 1:
             self.stats.gaps_detected += 1
             logger.warning(
                 f"[{self.client_id}] Seq gap on {symbol}: "
                 f"last={last} current={seq} delta={seq - last}"
             )
+            return SequenceDecision.GAP
+
         self.last_seq[symbol] = seq
-        return gap
+        return SequenceDecision.NEXT
 
     # ── Enqueue ───────────────────────────────────────────────────────────────
 

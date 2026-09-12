@@ -6,7 +6,7 @@ import pytest
 
 from src.gateway import gateway
 from src.gateway.aggregator import AggregationBuffer, AggregationMode
-from src.gateway.session import ClientSession, Encoding
+from src.gateway.session import ClientSession, Encoding, SlowConsumerPolicy
 from src.models import SnapshotData
 from tests.conftest import make_event, make_websocket
 
@@ -333,6 +333,82 @@ async def test_gap_recovery_resets_last_price(monkeypatch):
     assert delivered["type"] == "snapshot"
     assert delivered["seq"] == 200
     assert session.last_price["AAPL"] == 200.0
+
+
+@pytest.mark.asyncio
+async def test_stale_event_after_recovery_snapshot_is_discarded(monkeypatch):
+    snapshot = SnapshotData(
+        symbol="AAPL",
+        bid=205.0,
+        ask=205.1,
+        bid_size=500,
+        ask_size=300,
+        seq=205,
+        ts=1710001234567,
+    )
+
+    class Store:
+        async def get(self, symbol):
+            return snapshot
+
+    monkeypatch.setattr(gateway, "snapshot_store", Store())
+    session = make_session()
+    session.last_seq["AAPL"] = 100
+    session.aggregator.start()
+
+    task = asyncio.create_task(gateway.client_dispatch_loop(session))
+    session.aggregator.push(make_event(symbol="AAPL", seq=200))
+    session.aggregator.push(make_event(symbol="AAPL", seq=201))
+    session.aggregator.push(make_event(symbol="AAPL", seq=205))
+
+    delivered = await asyncio.wait_for(session._queue.get(), timeout=0.5)
+    await asyncio.sleep(0.05)
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert delivered["type"] == "snapshot"
+    assert delivered["seq"] == 205
+    assert session._queue.empty()
+    assert session.last_seq["AAPL"] == 205
+
+
+@pytest.mark.asyncio
+async def test_gap_recovery_does_not_advance_when_snapshot_enqueue_fails(monkeypatch):
+    snapshot = SnapshotData(
+        symbol="AAPL",
+        bid=205.0,
+        ask=205.1,
+        bid_size=500,
+        ask_size=300,
+        seq=205,
+        ts=1710001234567,
+    )
+
+    class Store:
+        async def get(self, symbol):
+            return snapshot
+
+    monkeypatch.setattr(gateway, "snapshot_store", Store())
+    session = make_session()
+    session.policy = SlowConsumerPolicy.DISCONNECT
+    session._queue = asyncio.Queue(maxsize=1)
+    session._queue.put_nowait({"type": "existing"})
+    session.last_seq["AAPL"] = 100
+    session.aggregator.start()
+
+    task = asyncio.create_task(gateway.client_dispatch_loop(session))
+    session.aggregator.push(make_event(symbol="AAPL", seq=200))
+    await asyncio.sleep(0.05)
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert session.last_seq["AAPL"] == 100
+    assert session.last_price.get("AAPL") is None
+    assert session.stats.dropped == 1
 
 
 def test_encoding_param_msgpack():

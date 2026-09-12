@@ -135,10 +135,13 @@ FeedSimulator
 ```
 KafkaConsumerBridge (background thread)
   → consumer.poll() [blocking, in dedicated thread]
-  → asyncio.run_coroutine_threadsafe(queue.put(event), loop)
-  → asyncio event loop receives event
+  → asyncio.run_coroutine_threadsafe(queue.put(envelope), loop)
+  → bounded handoff blocks polling while the queue is full
+  → asyncio event loop receives event + Kafka offset metadata
   → SnapshotStore.update(event) → Redis HSET snapshot:{symbol}
   → SnapshotStore.publish_event(event) → Redis PUBLISH events:{symbol} <json>
+  → acknowledge success to the consumer thread
+  → consumer thread commits the event offset
 ```
 
 **Event Fanout (Gateway — per instance):**
@@ -158,7 +161,8 @@ Gateway unsubscribes when the last local client unsubscribes.
 ```
 client_dispatch_loop (per-client asyncio.Task)
   → AggregationBuffer.events() [async generator]
-  → check_gap(symbol, seq) [RAW mode only]
+  → classify sequence as NEXT / GAP / STALE
+  → RAW: exact next sequence required; AGG_100MS: forward jumps allowed
   → session.enqueue(event.to_dict()) [BoundedQueue, non-blocking]
 
 WriterLoop (per-client asyncio.Task)
@@ -185,14 +189,15 @@ class MarketEvent:
     ask_size:   int          # ask quantity
     event_ts:   int          # upstream timestamp (ms since epoch)
     server_ts:  int          # ingestion timestamp (ms since epoch)
-    seq:        int          # global monotonic sequence number
+    seq:        int          # monotonic sequence number within symbol
     type:       EventType    # QUOTE | TRADE | SNAPSHOT
     last_price: float = 0.0  # last trade price (if type=TRADE)
     last_size:  int   = 0    # last trade size
 ```
 
 **Key invariants:**
-- `seq` is globally monotonically increasing, assigned at the simulator
+- `seq` is monotonically increasing within each symbol, assigned at the simulator
+- `seq` does not define ordering between different symbols
 - `event_ts` and `server_ts` difference = ingestion latency
 - `type` is always "quote" for incremental updates
 
@@ -312,7 +317,7 @@ Client connects → subscribes to AAPL
   → Server seeds client.last_seq["AAPL"] = N
   → Server registers client in SubscriptionRegistry["AAPL"]
   → Dispatch loop delivers events with seq > N
-  → Client checks each seq: gap > 5 → re-subscribe
+  → Client checks each per-symbol seq: expected N+1; a larger value triggers re-snapshot
 ```
 
 **Why seq=N matters:** Without it, the client doesn't know which incremental updates overlap with the snapshot. seq creates a deterministic boundary.
@@ -332,10 +337,17 @@ Client connects → subscribes to AAPL
 **Solution:**
 ```
 Thread: while True: msg = consumer.poll(0.1)
-          → asyncio.run_coroutine_threadsafe(queue.put(event), loop)
+          → asyncio.run_coroutine_threadsafe(queue.put(envelope), loop)
+          → stop polling while the bounded handoff is full
 
-asyncio: async for event in queue: ...
+asyncio: async for envelope in queue:
+           update Redis snapshot
+           publish Redis event
+           acknowledge the Kafka offset to the consumer thread
 ```
+
+Kafka auto-commit is disabled. The consumer is called only from its owner thread,
+and an offset is committed only after both Redis operations succeed.
 
 **Why not aiokafka:** confluent-kafka wraps librdkafka (C library) — faster and more production-proven. The thread bridge adds ~1ms overhead, negligible vs. total dispatch latency.
 
@@ -373,7 +385,7 @@ else:
 
 **Why:** Decouples Kafka consumer count from gateway instance count. One engine reads the full Kafka stream; N gateway instances each receive only the symbols their clients are watching — no per-instance Kafka consumer groups, no full-stream duplication. The gateway becomes stateless with respect to Kafka.
 
-**Tradeoff:** Redis Pub/Sub is fire-and-forget. A gateway instance that is slow, restarting, or briefly disconnected from Redis misses messages in-flight. Handled by the existing gap detection protocol (§5.2): a seq jump > 5 triggers a snapshot re-fetch from Redis, which is persistent. Net effect: a reconnecting gateway client sees one snapshot re-seed rather than a hard failure.
+**Tradeoff:** Redis Pub/Sub is fire-and-forget. A gateway instance that is slow, restarting, or briefly disconnected from Redis misses messages in-flight. In RAW mode, a missing next per-symbol sequence triggers a snapshot re-fetch from Redis, which is persistent. Net effect: a reconnecting gateway client sees one snapshot re-seed rather than a hard failure.
 
 ---
 
@@ -425,9 +437,9 @@ else:
 
 ---
 
-**Decision:** On `TimeoutError`, the batch is dropped and the Kafka offset is committed. On other exceptions, the writer retries with exponential back-off (max 5s), not committing until the write succeeds.
+**Decision:** On `TimeoutError` or another write exception, the writer retries with exponential back-off (max 5s) and does not commit until the write succeeds.
 
-**Why:** A timed-out batch is presumed partially written or unrecoverable; retrying risks duplicates and infinite blocking. A transient DB error (connection reset, lock timeout) is recoverable without data loss by retrying the same batch.
+**Why:** A timeout leaves the write result unknown. Retrying is safe because the database insert uses `ON CONFLICT DO NOTHING`; committing an unresolved batch would permanently lose Kafka records.
 
 ### 5.6 Why Coalescing Is NOT in ClientSession
 
@@ -444,13 +456,14 @@ Early implementation had a `_pending` dict in ClientSession that tracked the lat
 | Client disconnect | WebSocketDisconnect exception | Remove from all subscription registries, cancel writer task, cancel dispatch task, close aggregator |
 | Slow consumer (queue full) | asyncio.QueueFull in enqueue | Drop oldest message, increment dropped counter |
 | Persistent slow consumer | stats.dropped > threshold | Proactive disconnect via _disconnected event |
-| Sequence gap | check_gap returns True (seq jump > 5) | Re-fetch snapshot from Redis, re-seed last_seq, skip stale event |
-| Kafka consumer lag | Internal bridge queue bounded at 10,000 | Consumer.poll() blocks in its thread, asyncio loop unaffected |
+| Sequence gap | RAW sequence is greater than `last_seq + 1` | Re-fetch snapshot from Redis, re-seed last_seq, skip stale event |
+| Duplicate/stale sequence | Sequence is less than or equal to `last_seq` | Discard without moving the sequence boundary backward |
+| Kafka consumer lag | Internal bridge queue bounded at 10,000 | Consumer polling pauses while handoff is full; asyncio loop remains unaffected |
 | Redis restart | AOF persistence | Snapshot restored on startup; Kafka replay fills gaps within seconds |
 | Feed simulator crash | Kafka retains event log | Engine resumes from last committed offset on restart |
 | Gateway restart | All WebSocket connections drop | Clients reconnect, re-subscribe, get fresh snapshot |
 | TimescaleDB unavailable at TickWriter start | Connection error on `ensure_schema` | Exponential back-off retry; Kafka offset not committed until write succeeds |
-| Tick batch write timeout | `asyncio.TimeoutError` from asyncpg | Batch dropped, `dropped_ticks` incremented, offset committed; logged at ERROR |
+| Tick batch write timeout | `asyncio.TimeoutError` from asyncpg | Retry with bounded back-off; offset remains uncommitted until success |
 | Tick batch write error (non-timeout) | Exception from `insert_ticks` | Retry with back-off up to 5s per attempt; offset not committed until success |
 | Duplicate tick on retry | `ON CONFLICT DO NOTHING` | Silently skipped; insert is idempotent |
 | HistoryStore DB unavailable at query time | asyncpg pool error | Returns HTTP 504 to caller; no fanout impact |
