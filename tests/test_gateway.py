@@ -44,6 +44,7 @@ async def reset_gateway_state():
     async with gateway.pubsub_lock:
         gateway.active_channels.clear()
         gateway.confirmed_channels.clear()
+        gateway.channel_demand.clear()
         gateway.redis_pubsub = FakePubSub()
     yield
     async with gateway.subscriptions_lock:
@@ -53,6 +54,7 @@ async def reset_gateway_state():
     async with gateway.pubsub_lock:
         gateway.active_channels.clear()
         gateway.confirmed_channels.clear()
+        gateway.channel_demand.clear()
         gateway.redis_pubsub = None
 
 
@@ -95,6 +97,30 @@ class FakePubSub:
 
     async def aclose(self):
         self.closed = True
+
+
+@pytest.mark.asyncio
+async def test_fanout_waits_without_channel_demand(monkeypatch):
+    class Redis:
+        def __init__(self):
+            self.pubsub_calls = 0
+
+        def pubsub(self, **kwargs):
+            self.pubsub_calls += 1
+            return FakePubSub()
+
+    class Store:
+        redis = Redis()
+
+    monkeypatch.setattr(gateway, "snapshot_store", Store())
+    task = asyncio.create_task(gateway.fanout_loop())
+    await asyncio.sleep(0)
+
+    assert Store.redis.pubsub_calls == 0
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
 
 
 @pytest.mark.asyncio
@@ -281,6 +307,7 @@ async def test_unsubscribe_last_client_unsubscribes_pubsub_channel():
 
     assert pubsub.unsubscribed == ["events:AAPL"]
     assert "events:AAPL" not in gateway.active_channels
+    assert gateway.channel_demand.is_set() is False
 
 
 @pytest.mark.asyncio
@@ -306,6 +333,7 @@ async def test_pubsub_subscribe_retries_transient_failure():
     assert await gateway._ensure_pubsub_subscription("AAPL") is True
     assert pubsub.subscribed == ["events:AAPL"]
     assert "events:AAPL" in gateway.confirmed_channels
+    assert gateway.channel_demand.is_set()
 
 
 @pytest.mark.asyncio
@@ -558,12 +586,45 @@ def test_encoding_param_invalid_falls_back_to_json(caplog):
     assert "Unknown encoding 'protobuf'" in caplog.text
 
 
-def test_invalid_subscription_filter_is_ignored(caplog):
-    with caplog.at_level("WARNING"):
-        result = gateway._parse_subscription_filter({"min_change_pct": "nope"})
+@pytest.mark.parametrize(
+    "name,value",
+    [
+        ("min_change_pct", "nope"),
+        ("max_spread", -1),
+        ("min_change_pct", float("nan")),
+        ("max_spread", float("inf")),
+        ("max_spread", float("-inf")),
+        ("min_change_pct", True),
+    ],
+)
+def test_invalid_subscription_filter_is_rejected(name, value):
+    with pytest.raises(ValueError):
+        gateway._parse_subscription_filter({name: value})
 
-    assert result is None
-    assert "Invalid subscription filter" in caplog.text
+
+def test_zero_subscription_filter_values_are_valid():
+    result = gateway._parse_subscription_filter({
+        "min_change_pct": 0,
+        "max_spread": 0.0,
+    })
+
+    assert result.min_change_pct == 0
+    assert result.max_spread == 0
+
+
+@pytest.mark.asyncio
+async def test_invalid_subscription_filter_returns_client_error_without_subscribing():
+    session = make_session()
+
+    assert await gateway._subscribe(
+        session,
+        "AAPL",
+        {"min_change_pct": "nope"},
+    ) is False
+
+    assert "must be a number" in session._queue.get_nowait()["error"]
+    assert "AAPL" not in session.subscriptions
+    assert "events:AAPL" not in gateway.active_channels
 
 
 @pytest.mark.asyncio
@@ -749,3 +810,31 @@ async def test_history_query_timeout_returns_504(monkeypatch):
 
     assert response.status_code == 504
     assert response_json(response)["error"] == "history query timed out"
+
+
+@pytest.mark.asyncio
+async def test_history_database_unavailable_returns_503(monkeypatch):
+    from src.storage.history_store import HistoryStoreUnavailableError
+
+    monkeypatch.setattr(
+        gateway,
+        "history_store",
+        FakeHistoryStore(exc=HistoryStoreUnavailableError()),
+    )
+
+    response = await gateway.get_history("AAPL", from_ts="1", to_ts="2")
+
+    assert response.status_code == 503
+    assert response_json(response)["error"] == "history database unavailable"
+
+
+@pytest.mark.asyncio
+async def test_history_out_of_range_timestamp_returns_400():
+    response = await gateway.get_history(
+        "AAPL",
+        from_ts="1",
+        to_ts=str(10**30),
+    )
+
+    assert response.status_code == 400
+    assert "valid Unix milliseconds" in response_json(response)["error"]

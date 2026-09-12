@@ -2,9 +2,11 @@ import asyncio
 import inspect
 import json
 import logging
+import math
 import uuid
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse, Response
@@ -19,7 +21,11 @@ from src.gateway.session import (
 )
 from src.gateway.aggregator import AggregationBuffer, AggregationMode
 from src.models import EventType, MarketEvent
-from src.storage.history_store import DEFAULT_HISTORY_LIMIT, HistoryStore
+from src.storage.history_store import (
+    DEFAULT_HISTORY_LIMIT,
+    HistoryStore,
+    HistoryStoreUnavailableError,
+)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -37,6 +43,7 @@ all_sessions: dict[str, ClientSession] = {}
 active_channels: set[str] = set()
 confirmed_channels: set[str] = set()
 redis_pubsub = None
+channel_demand = asyncio.Event()
 INITIALIZATION_BUFFER_MAX_SIZE = 500
 
 
@@ -67,19 +74,24 @@ def _parse_encoding(client_id: str, encoding_param: str | None) -> Encoding:
 # ── Fanout loop ───────────────────────────────────────────────────────────────
 
 def _parse_subscription_filter(payload) -> SubscriptionFilter | None:
+    if payload is None:
+        return None
     if not isinstance(payload, dict):
-        return None
+        raise ValueError("filter must be an object")
 
-    min_change_pct = payload.get("min_change_pct")
-    max_spread = payload.get("max_spread")
-    try:
-        return SubscriptionFilter(
-            min_change_pct=float(min_change_pct) if min_change_pct is not None else None,
-            max_spread=float(max_spread) if max_spread is not None else None,
-        )
-    except (TypeError, ValueError):
-        logger.warning("Invalid subscription filter %r, ignoring", payload)
-        return None
+    parsed = {}
+    for name in ("min_change_pct", "max_spread"):
+        value = payload.get(name)
+        if value is None:
+            parsed[name] = None
+            continue
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError(f"filter.{name} must be a number")
+        numeric = float(value)
+        if not math.isfinite(numeric) or numeric < 0:
+            raise ValueError(f"filter.{name} must be finite and non-negative")
+        parsed[name] = numeric
+    return SubscriptionFilter(**parsed)
 
 
 def _parse_pubsub_event(data) -> MarketEvent | None:
@@ -126,6 +138,7 @@ async def fanout_loop():
     logger.info("Redis Pub/Sub fanout loop started")
 
     while True:
+        await channel_demand.wait()
         pubsub = snapshot_store.redis.pubsub(ignore_subscribe_messages=True)
         try:
             async with pubsub_lock:
@@ -180,13 +193,17 @@ async def _fanout_event(event: MarketEvent):
 
 
 def _event_channel(symbol: str) -> str:
-    return f"events:{symbol}"
+    channel_factory = getattr(snapshot_store, "event_channel", None)
+    if channel_factory is None:
+        return f"events:{symbol}"
+    return channel_factory(symbol)
 
 
 async def _subscribe_pubsub_symbol(symbol: str) -> bool:
     channel = _event_channel(symbol)
     async with pubsub_lock:
         active_channels.add(channel)
+        channel_demand.set()
         if channel in confirmed_channels:
             return True
         if redis_pubsub is None:
@@ -221,6 +238,8 @@ async def _unsubscribe_pubsub_symbol(symbol: str):
             return
         active_channels.remove(channel)
         confirmed_channels.discard(channel)
+        if not active_channels:
+            channel_demand.clear()
         if redis_pubsub is not None:
             try:
                 await redis_pubsub.unsubscribe(channel)
@@ -538,6 +557,11 @@ async def get_history(
             status_code=504,
             content={"error": "history query timed out"},
         )
+    except HistoryStoreUnavailableError:
+        return JSONResponse(
+            status_code=503,
+            content={"error": "history database unavailable"},
+        )
 
     if not ticks:
         return JSONResponse(
@@ -579,6 +603,15 @@ def _parse_history_params(
         return JSONResponse(
             status_code=400,
             content={"error": "from_ts must be <= to_ts"},
+        )
+
+    try:
+        datetime.fromtimestamp(start_ts / 1000.0, tz=UTC)
+        datetime.fromtimestamp(end_ts / 1000.0, tz=UTC)
+    except (OverflowError, OSError, ValueError):
+        return JSONResponse(
+            status_code=400,
+            content={"error": "from_ts and to_ts must be valid Unix milliseconds"},
         )
 
     if row_limit <= 0:
@@ -692,6 +725,12 @@ async def _subscribe(session: ClientSession, symbol: str, filter_payload=None):
     2. Seed last_seq[symbol] = N for gap detection
     3. Register in SubscriptionRegistry so later fanout events are delivered
     """
+    try:
+        subscription_filter = _parse_subscription_filter(filter_payload)
+    except ValueError as exc:
+        session.enqueue({"error": str(exc)})
+        return False
+
     if not await _ensure_pubsub_subscription(symbol):
         session.enqueue({"error": f"subscription unavailable for {symbol}"})
         logger.warning(
@@ -702,7 +741,6 @@ async def _subscribe(session: ClientSession, symbol: str, filter_payload=None):
         await _remove_desired_channel_if_unused(symbol)
         return False
 
-    subscription_filter = _parse_subscription_filter(filter_payload)
     initialization = SubscriptionInitialization()
     async with subscriptions_lock:
         initializing_subscriptions.setdefault(symbol, {})[session] = initialization

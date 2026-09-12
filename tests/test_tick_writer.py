@@ -122,7 +122,6 @@ async def test_flush_retries_timeout_without_commit_until_success():
     await writer._flush(batch, consumer)
 
     assert store.calls == 2
-    assert writer.dropped_ticks == 0
     assert writer.inserted_ticks == 2
     assert consumer.commits == 1
 
@@ -143,7 +142,6 @@ async def test_flush_shutdown_during_timeout_retry_does_not_commit():
 
     assert flushed is False
     assert consumer.commits == 0
-    assert writer.dropped_ticks == 0
 
 
 @pytest.mark.asyncio

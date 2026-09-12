@@ -45,16 +45,10 @@ JSON saturates at ~570k ops/sec; msgpack handles ~1.6M ops/sec with headroom to 
 
 ## 2. Dispatch Latency Benchmark
 
-> **Stale evidence:** The figures below were produced by the previous benchmark,
-> which did not read or validate WebSocket frames and averaged per-client p99s.
-> They are retained only as historical context and must not be used as current
-> NFR evidence. Rerun `load_bench` and replace this section before making a
-> latency or zero-drop claim.
-
 Measures end-to-end dispatch latency (time from `event_ts` on the MarketEvent to when it is written to the WebSocket) under increasing concurrent client load.
 
 **Setup:**
-- Feed: 50 events/sec, 5 symbols (AAPL, TSLA, GOOGL, MSFT, BTCUSD)
+- Feed: 50 events/sec per symbol, 5 symbols (250 total events/sec)
 - Each client subscribes to AAPL + TSLA
 - Duration: 15 seconds per scenario
 - Aggregation mode: RAW (every tick delivered)
@@ -65,19 +59,25 @@ Measures end-to-end dispatch latency (time from `event_ts` on the MarketEvent to
 python3 -m src.benchmark.load_bench
 ```
 
+**Validated:** 2026-09-12 on Docker Desktop 4.65.0 / WSL2 Ubuntu, Python 3.12.
+The client actively received and decoded every WebSocket frame. Percentiles are
+computed over the combined client-observed latency samples (`now - event_ts`);
+empty clients, malformed frames, sequence regressions, and unexpected
+disconnects invalidate a scenario. Redis used an isolated validation namespace.
+
 **Results:**
 
-| Clients | p50 (ms) | p99 (ms) | Total Sent | Dropped |
-|---------|----------|----------|------------|---------|
-| 1       | 8.33     | 11.25    | 1,274      | 0       |
-| 5       | 7.85     | 9.40     | 6,429      | 0       |
-| 10      | 7.99     | 9.54     | 12,838     | 0       |
-| 20      | 8.38     | 10.22    | 25,687     | 0       |
+| Clients | p50 (ms) | p99 (ms) | Received | Dropped | Errors |
+|---------|----------|----------|----------|---------|--------|
+| 1       | 8.72     | 10.86    | 1,474    | 0       | 0      |
+| 5       | 8.96     | 11.12    | 7,424    | 0       | 0      |
+| 10      | 9.22     | 11.92    | 14,842   | 0       | 0      |
+| 20      | 9.90     | 13.03    | 29,655   | 0       | 0      |
 
 **Key observations:**
 
 1. **Latency is stable across client counts.**
-   p99 stays within 11.25ms → 9.40ms → 9.54ms → 10.22ms as clients scale from 1 to 20.
+   p99 stays within 10.86ms → 11.12ms → 11.92ms → 13.03ms as clients scale from 1 to 20.
    This validates the per-client BoundedQueue design: the fanout loop is never blocked by a slow client,
    so adding more clients does not increase tail latency for existing ones.
 
@@ -86,7 +86,7 @@ python3 -m src.benchmark.load_bench
    The outbound queue (maxsize=500) was never saturated in this scenario.
 
 3. **Linear throughput scaling.**
-   Total messages sent scales linearly: 1,274 → 6,429 → 12,838 → 25,687,
+   Received messages scale linearly: 1,474 → 7,424 → 14,842 → 29,655,
    roughly proportional to client count as expected.
 
 ---
@@ -131,6 +131,17 @@ type=quote    seq=391 bid=207.88
 
 ---
 
+## 4. Kafka Acknowledgement Coalescing
+
+`tests/test_engine.py::test_acknowledgements_coalesce_contiguous_offsets_per_partition`
+verifies the commit round-trip reduction deterministically: three acknowledged
+events across two partitions are committed in one synchronous Kafka call, with
+each partition advanced only to its highest contiguous safe offset. The prior
+implementation required one synchronous call per event. No network-latency
+number is claimed because the result depends on broker placement.
+
+---
+
 ## Reproducing Results
 
 ```bash
@@ -149,7 +160,13 @@ python3 -m src.gateway.gateway
 # Terminal 3: run benchmarks
 python3 -m src.benchmark.serialization_bench
 python3 -m src.benchmark.load_bench
+
+# Full local infrastructure validation, using an isolated Redis namespace
+bash scripts/run_local_validation.sh
 ```
+
+The same run also queried `GET /history/AAPL` against TimescaleDB and returned
+persisted events with per-symbol sequences `1, 2, 3` from the validation window.
 
 Note: latency numbers include WSL2 loopback overhead (~2-5ms).
 On a native Linux machine or in production (co-located services), expect lower absolute numbers

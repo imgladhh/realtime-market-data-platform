@@ -44,7 +44,7 @@ This system models the core infrastructure behind platforms like Bloomberg Termi
 | ID | Requirement |
 |----|-------------|
 | NFR-1 | p99 dispatch latency < 15ms under 20 concurrent clients |
-| NFR-2 | Zero message drops under normal load (50 events/sec, 20 clients) |
+| NFR-2 | Zero message drops under normal load (50 events/sec per symbol, 5 symbols, 20 clients) |
 | NFR-3 | Slow clients must not degrade performance for fast clients |
 | NFR-4 | System must survive client disconnect/reconnect gracefully |
 | NFR-5 | Feed simulator crash must not take down the distribution engine |
@@ -141,7 +141,8 @@ KafkaConsumerBridge (background thread)
   → SnapshotStore.update(event) → Redis HSET snapshot:{symbol}
   → SnapshotStore.publish_event(event) → Redis PUBLISH events:{symbol} <json>
   → acknowledge success to the consumer thread
-  → consumer thread commits the event offset
+  → consumer thread coalesces contiguous acknowledgements per partition
+  → one synchronous commit advances each partition to its highest safe offset
 ```
 
 **Event Fanout (Gateway — per instance):**
@@ -231,6 +232,10 @@ Message: JSON-serialised MarketEvent
 Publisher: DistributionEngine (after each snapshot update)
 Subscribers: Gateway instances (on-demand, per active symbol)
 ```
+
+`MARKET_DATA_NAMESPACE` optionally prefixes snapshot keys and Pub/Sub channels.
+The local validation script uses a unique namespace per run so benchmark state
+cannot collide with existing Redis data.
 
 ### 4.3 market_ticks (TimescaleDB hypertable)
 
@@ -432,7 +437,7 @@ else:
 
 **Why:** `event_ts` is producer-stamped and deterministic. `received_at` varies with consumer lag and is opaque to callers. Per FR-13, the API contract is event-time filtering.
 
-**Tradeoff:** A tick with a stale or skewed `event_ts` (e.g., replayed from Kafka) may land in an unexpected time chunk. Acceptable given that `seq` is globally monotonic and the deduplication index prevents double-counting.
+**Tradeoff:** A tick with a stale or skewed `event_ts` (e.g., replayed from Kafka) may land in an unexpected time chunk. The per-symbol `seq` plus the deduplication index prevents double-counting for an identical event identity.
 
 ---
 
@@ -473,7 +478,7 @@ Early implementation had a `_pending` dict in ClientSession that tracked the lat
 | Tick batch write timeout | `asyncio.TimeoutError` from asyncpg | Retry with bounded back-off; offset remains uncommitted until success |
 | Tick batch write error (non-timeout) | Exception from `insert_ticks` | Retry with back-off up to 5s per attempt; offset not committed until success |
 | Duplicate tick on retry | `ON CONFLICT DO NOTHING` | Silently skipped; insert is idempotent |
-| HistoryStore DB unavailable at query time | asyncpg pool error | Returns HTTP 504 to caller; no fanout impact |
+| HistoryStore DB unavailable at query time | asyncpg connection/pool error | Returns HTTP 503 to caller; no fanout impact |
 | TickWriter consumer lag | Kafka consumer group lag metric | Operational alert only; no impact on `gateway-engine` group |
 | Gateway instance crash | Load balancer `/health` probe fails | Sticky clients reconnect; routed to surviving instances; re-subscribe yields fresh snapshot |
 | Redis Pub/Sub disconnect in gateway | Exception in `pubsub.listen()` | `fanout_loop` reconnects with exponential back-off (max 5s), clears confirmations, and re-subscribes every desired channel |
@@ -620,6 +625,7 @@ Response: 400 — missing/invalid params, from_ts > to_ts, limit <= 0
 Response: 404 — no ticks in range
 {"error": "No history for AAPL"}
 
+Response: 503 — history database unavailable
 Response: 504 — database query timeout
 {"error": "history query timed out"}
 ```
@@ -696,16 +702,19 @@ Aggregated stats across all connected clients.
 
 ### 8.1 Dispatch Latency
 
-50 events/sec, 5 symbols, 2 subscribed per client, 15s duration:
+Validated 2026-09-12: 50 events/sec per symbol (250 total), 5 symbols,
+2 subscribed per client, 15s duration. Percentiles use combined client-observed
+latency samples and every scenario validates received frames:
 
-| Clients | p50 (ms) | p99 (ms) | Total Sent | Dropped |
+| Clients | p50 (ms) | p99 (ms) | Received | Dropped |
 |---------|----------|----------|------------|---------|
-| 1       | 8.33     | 11.25    | 1,274      | 0       |
-| 5       | 7.85     | 9.40     | 6,429      | 0       |
-| 10      | 7.99     | 9.54     | 12,838     | 0       |
-| 20      | 8.38     | 10.22    | 25,687     | 0       |
+| 1       | 8.72     | 10.86    | 1,474      | 0       |
+| 5       | 8.96     | 11.12    | 7,424      | 0       |
+| 10      | 9.22     | 11.92    | 14,842     | 0       |
+| 20      | 9.90     | 13.03    | 29,655     | 0       |
 
-**Key finding:** p99 stays flat as clients scale. Per-client queue isolation works.
+**Key finding:** 20-client p99 remains below 15ms with zero drops. Per-client
+queue isolation satisfies the measured normal-load target.
 
 ### 8.2 Serialization
 

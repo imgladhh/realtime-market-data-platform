@@ -39,65 +39,27 @@ It models a simplified version of what real market data platforms (Bloomberg, Re
 ## Architecture Overview
 
 ```
-┌──────────────────────────────────────────────────────────────────┐
-│                        FeedSimulator                             │
-│   Generates mock price updates via random walk model            │
-│   Produces MarketEvent → Kafka (key = symbol)                   │
-└────────────────────────┬─────────────────────────────────────────┘
-                         │ produce
-                         ▼
-┌──────────────────────────────────────────────────────────────────┐
-│                          Kafka                                   │
-│   Topic: market-events                                           │
-│   Partitioned by symbol hash → per-symbol ordering guaranteed   │
-│   Retains event log → supports offset replay on reconnect       │
-└────────────────────────┬─────────────────────────────────────────┘
-                         │ consume
-                         ▼
-┌──────────────────────────────────────────────────────────────────┐
-│                   DistributionEngine                             │
-│                                                                  │
-│  ┌─────────────────────────────────────────────────────────┐    │
-│  │  KafkaConsumerBridge                                    │    │
-│  │  - Runs confluent-kafka consumer in dedicated thread    │    │
-│  │  - Bridges events into asyncio event loop               │    │
-│  │    via asyncio.run_coroutine_threadsafe                  │    │
-│  └──────────────────────┬──────────────────────────────────┘    │
-│                         │                                        │
-│  ┌──────────────────────▼──────────────────────────────────┐    │
-│  │  FanoutDispatcher                                       │    │
-│  │  - Updates Redis SnapshotStore                          │    │
-│  │  - Looks up SubscriptionRegistry (symbol → sessions)   │    │
-│  │  - Pushes into each session's AggregationBuffer        │    │
-│  │  - Never blocks: push is always non-blocking            │    │
-│  └──────────────────────┬──────────────────────────────────┘    │
-└─────────────────────────────────────────────────────────────────-┘
-                         │
-          ┌──────────────┼──────────────┐
-          ▼              ▼              ▼
-┌──────────────┐ ┌──────────────┐ ┌──────────────┐
-│ClientSession │ │ClientSession │ │ClientSession │
-│              │ │              │ │              │
-│ AggregationB │ │ AggregationB │ │ AggregationB │
-│ RAW or 100ms │ │ RAW or 100ms │ │ RAW or 100ms │
-│              │ │              │ │              │
-│ BoundedQueue │ │ BoundedQueue │ │ BoundedQueue │
-│ (maxsize=500)│ │ (maxsize=500)│ │ (maxsize=500)│
-│              │ │              │ │              │
-│ WriterLoop   │ │ WriterLoop   │ │ WriterLoop   │
-│ (independent)│ │ (independent)│ │ (independent)│
-└──────┬───────┘ └──────┬───────┘ └──────┬───────┘
-       │ WS             │ WS             │ WS
-       ▼                ▼                ▼
-    Client A         Client B         Client C
-
-┌──────────────────────────────────────────────────────────────────┐
-│                           Redis                                  │
-│   SnapshotStore: HSET snapshot:{symbol}                         │
-│   Stores latest bid/ask/seq per symbol                          │
-│   Read on new client subscribe → snapshot + seq alignment       │
-│   AOF persistence: survives Redis restart                       │
-└──────────────────────────────────────────────────────────────────┘
+FeedSimulator ──produce, key=symbol──▶ Kafka: market-events
+                                         │
+                      ┌──────────────────┴──────────────────┐
+                      │ group: gateway-engine               │ group: tick-storage
+                      ▼                                     ▼
+              DistributionEngine                        TickWriter
+              update snapshot, publish                  batch ≤500 / ≤100ms
+                      │                                     │
+                      ▼                                     ▼
+              Redis Snapshot + Pub/Sub                 TimescaleDB
+                      │                              persistent history
+             events:{symbol} broadcast                       ▲
+                      │                                      │
+              ┌───────┴────────┐                    GET /history/{symbol}
+              ▼                ▼                              │
+          Gateway 1        Gateway 2 ... ─────────────────────┘
+              │                │
+        per-client bounded queues, RAW/AGG_100MS, JSON/msgpack
+              │                │
+              ▼                ▼
+            WebSocket clients on any gateway instance
 ```
 
 ---
@@ -419,24 +381,23 @@ tests/
 
 ### Dispatch Latency (load benchmark)
 
-The historical figures below are stale pending a rerun of the validating load
-client. The current benchmark actively receives and decodes every frame, reports
-empty clients, malformed frames, disconnects and sequence regressions, and
-computes percentiles from the combined client receive-latency samples.
+Validated on 2026-09-12 with Docker Desktop/WSL2. The benchmark actively receives
+and decodes every frame and computes percentiles from combined client-observed
+latency samples. Empty clients, malformed frames, disconnects, or sequence
+regressions invalidate the scenario.
 
 50 events/sec per symbol, 2 symbols (AAPL + TSLA), 15s per scenario:
 
-| Clients | p50 (ms) | p99 (ms) | Total Sent | Dropped |
-|---------|----------|----------|------------|---------|
-| 1       | 8.33     | 11.25    | 1,274      | 0       |
-| 5       | 7.85     | 9.40     | 6,429      | 0       |
-| 10      | 7.99     | 9.54     | 12,838     | 0       |
-| 20      | 8.38     | 10.22    | 25,687     | 0       |
+| Clients | p50 (ms) | p99 (ms) | Received | Dropped |
+|---------|----------|----------|----------|---------|
+| 1       | 8.72     | 10.86    | 1,474    | 0       |
+| 5       | 8.96     | 11.12    | 7,424    | 0       |
+| 10      | 9.22     | 11.92    | 14,842   | 0       |
+| 20      | 9.90     | 13.03    | 29,655   | 0       |
 
-**Historical observation (not current evidence):** the previous run reported stable
-~10ms p99 latency from 1 to 20 clients with zero server-side queue drops. Rerun
-the validating benchmark before using those values as evidence. See
-`benchmark/results.md` for the retained output and its limitations.
+At 20 clients, validated p99 is 13.03ms with zero server-side queue drops,
+meeting the project target. See `src/benchmark/results.md` for environment and
+measurement details.
 
 ### Serialization Benchmark (100,000 iterations)
 
@@ -461,12 +422,17 @@ the validating benchmark before using those values as evidence. See
 | Kafka consumer lag | Internal bridge queue bounded at 10,000 events |
 | Redis restart | AOF persistence restores snapshot data on startup |
 | Feed simulator crash | Kafka retains event log; engine resumes from last offset on restart |
+| Engine Redis failure | Retries the unacknowledged event with bounded exponential backoff |
+| History database unavailable | Returns HTTP 503 without affecting live fanout |
+| TickWriter shutdown with a partial batch | Leaves offsets uncommitted for replay on restart |
 
 ---
 
 ## Testing
 
-40 tests covering core components. No external dependencies required (Redis mocked).
+The unit suite covers core components with Redis, Kafka, and TimescaleDB
+boundaries mocked. Run `pytest -q` for the current count instead of relying on a
+hard-coded number in this document.
 
 ```bash
 pip install pytest pytest-asyncio
@@ -509,6 +475,9 @@ curl http://localhost:8000/metrics/summary
 # 6. Run benchmarks
 python3 -m src.benchmark.serialization_bench
 python3 -m src.benchmark.load_bench
+
+# Or run the complete Kafka/Redis/TimescaleDB validation
+bash scripts/run_local_validation.sh
 ```
 
 **Kafka UI:** http://localhost:8080
@@ -517,21 +486,9 @@ python3 -m src.benchmark.load_bench
 
 ## Future Extensions
 
-**Multi-node gateway scaling**
-Run multiple gateway instances behind a load balancer. Replace in-memory `SubscriptionRegistry` with Redis Pub/Sub for cross-process fanout. Kafka consumer group ensures each event is processed once regardless of instance count.
-
 **Kafka offset replay on reconnect**
 Clients with a small seq gap replay directly from Kafka offset instead of fetching a full snapshot. Reduces Redis load and provides seamless reconnection for briefly-disconnected clients.
 
-**Historical storage**
-Add a dedicated `history-writer` Kafka consumer group that asynchronously writes all ticks to PostgreSQL. Completely isolated from the hot path — write latency does not affect real-time delivery.
-
-**True msgpack wire format**
-Replace JSON encoding end-to-end. ~26% bandwidth reduction, 2.91x faster serialization at high message rates. Benchmarked and ready to wire in.
-
-**Conditional subscription filters**
-Extend subscription to support delivery conditions:
-```json
-{"action": "subscribe", "symbol": "AAPL", "filter": {"spread_gt": 0.05}}
-```
-Clients only receive updates when spread widens beyond threshold — closer to real professional data feed behavior.
+**Security and operational resilience**
+Add TLS/authentication, Kafka multi-broker failover, Redis Sentinel/Cluster,
+production process supervision, and deployment-level load-balancer automation.

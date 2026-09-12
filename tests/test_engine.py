@@ -41,12 +41,12 @@ class FakeBridge:
         pass
 
 
-def consumed_event(seq=10):
+def consumed_event(seq=10, partition=2, offset=41):
     return ConsumedEvent(
         event=make_event(symbol="AAPL", seq=seq),
         topic="market-events",
-        partition=2,
-        offset=41,
+        partition=partition,
+        offset=offset,
     )
 
 
@@ -131,6 +131,7 @@ def test_acknowledgement_commits_explicit_next_offset():
     bridge = KafkaConsumerBridge()
     consumer = Consumer()
     consumed = consumed_event()
+    bridge._track_consumed(consumed)
     bridge.acknowledge(consumed)
 
     bridge._drain_acknowledgements(
@@ -140,6 +141,36 @@ def test_acknowledgement_commits_explicit_next_offset():
 
     assert consumer.commits == [{
         "offsets": [("market-events", 2, 42)],
+        "asynchronous": False,
+    }]
+
+
+def test_acknowledgements_coalesce_contiguous_offsets_per_partition():
+    class Consumer:
+        def __init__(self):
+            self.commits = []
+
+        def commit(self, **kwargs):
+            self.commits.append(kwargs)
+
+    bridge = KafkaConsumerBridge()
+    consumer = Consumer()
+    first = consumed_event(partition=2, offset=41)
+    second = consumed_event(partition=2, offset=42)
+    other = consumed_event(partition=1, offset=5)
+    for consumed in (first, second, other):
+        bridge._track_consumed(consumed)
+
+    bridge.acknowledge(second)
+    bridge._drain_acknowledgements(consumer, lambda *parts: parts)
+    assert consumer.commits == []
+
+    bridge.acknowledge(first)
+    bridge.acknowledge(other)
+    bridge._drain_acknowledgements(consumer, lambda *parts: parts)
+
+    assert consumer.commits == [{
+        "offsets": [("market-events", 2, 43), ("market-events", 1, 6)],
         "asynchronous": False,
     }]
 

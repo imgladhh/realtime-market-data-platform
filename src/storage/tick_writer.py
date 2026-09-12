@@ -43,7 +43,6 @@ class TickWriter:
         self.store = store or HistoryStore()
         self.batch_max_size = batch_max_size
         self.batch_max_latency_ms = batch_max_latency_ms
-        self.dropped_ticks = 0
         self.inserted_ticks = 0
         self._stop = False
 
@@ -115,8 +114,8 @@ class TickWriter:
                     await self._flush(batch, consumer)
                     batch = []
 
-            if batch:
-                await self._flush(batch, consumer)
+            # A partial tail batch is intentionally left uncommitted on stop;
+            # Kafka replays it on the next run.
         finally:
             consumer.close()
             await self.store.close()

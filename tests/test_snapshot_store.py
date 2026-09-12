@@ -45,6 +45,7 @@ class TestSnapshotStore:
         mock_redis.publish.return_value = 2
         mock_redis.ping.return_value = True
         store.redis = mock_redis
+        store._prefix = ""
         return store, mock_redis
 
     # ── update ────────────────────────────────────────────────────────────────
@@ -97,6 +98,19 @@ class TestSnapshotStore:
         channel, payload = mock_redis.publish.call_args[0]
         assert channel == "events:AAPL"
         assert json.loads(payload)["seq"] == 10
+
+    @pytest.mark.asyncio
+    async def test_namespace_is_applied_to_keys_and_channels(self):
+        store, mock_redis = self.make_store()
+        store._prefix = "validation-123:"
+        event = make_event(symbol="AAPL", seq=10)
+
+        await store.update(event)
+        await store.publish_event(event)
+
+        pipe = mock_redis.pipeline.return_value
+        assert pipe.hset_calls[0][0][0] == "validation-123:snapshot:AAPL"
+        assert mock_redis.publish.call_args[0][0] == "validation-123:events:AAPL"
 
     @pytest.mark.asyncio
     async def test_ping_delegates_to_redis(self):

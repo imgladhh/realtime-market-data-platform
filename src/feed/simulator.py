@@ -68,11 +68,18 @@ class FeedSimulator:
         if err:
             logger.error(f"Delivery failed: {err}")
 
-    def run(self, events_per_second: int = 100):
-        """Produce events in round-robin across all symbols."""
+    def run(self, events_per_second_per_symbol: int = 100):
+        """Produce the configured rate independently for every symbol."""
         symbols = list(INITIAL_PRICES.keys())
-        interval = 1.0 / events_per_second
-        logger.info(f"FeedSimulator starting: {len(symbols)} symbols, {events_per_second} events/sec")
+        interval = 1.0 / events_per_second_per_symbol
+        total_rate = events_per_second_per_symbol * len(symbols)
+        logger.info(
+            "FeedSimulator starting: %d symbols, %d events/sec/symbol "
+            "(%d total events/sec)",
+            len(symbols),
+            events_per_second_per_symbol,
+            total_rate,
+        )
 
         while True:
             for symbol in symbols:
@@ -89,4 +96,4 @@ class FeedSimulator:
 
 if __name__ == "__main__":
     sim = FeedSimulator()
-    sim.run(events_per_second=50)
+    sim.run(events_per_second_per_symbol=50)

@@ -12,6 +12,22 @@ MAX_HISTORY_LIMIT = 10000
 DEFAULT_HISTORY_LIMIT = 1000
 
 
+class HistoryStoreUnavailableError(RuntimeError):
+    """The database cannot currently serve history requests."""
+
+
+def _is_unavailable_error(exc: Exception) -> bool:
+    if isinstance(exc, (ConnectionError, OSError, TimeoutError, asyncio.TimeoutError)):
+        return True
+    return type(exc).__name__ in {
+        "CannotConnectNowError",
+        "ConnectionDoesNotExistError",
+        "ConnectionFailureError",
+        "ConnectionRejectionError",
+        "TooManyConnectionsError",
+    }
+
+
 class HistoryStore:
     def __init__(
         self,
@@ -32,10 +48,17 @@ class HistoryStore:
 
         import asyncpg
 
-        self._pool = await asyncpg.create_pool(
-            self.database_url,
-            command_timeout=self.command_timeout,
-        )
+        try:
+            self._pool = await asyncpg.create_pool(
+                self.database_url,
+                command_timeout=self.command_timeout,
+            )
+        except Exception as exc:
+            if _is_unavailable_error(exc):
+                raise HistoryStoreUnavailableError(
+                    "history database unavailable"
+                ) from exc
+            raise
 
     async def close(self):
         if self._pool is not None:
@@ -127,27 +150,34 @@ class HistoryStore:
         from_time = _ms_to_datetime(from_ts)
         to_time = _ms_to_datetime(to_ts)
 
-        async with self._pool.acquire() as conn:
-            rows = await conn.fetch(
-                """
-                SELECT
-                    seq,
-                    (EXTRACT(EPOCH FROM event_time) * 1000)::BIGINT AS event_ts,
-                    bid,
-                    ask,
-                    bid_size,
-                    ask_size
-                FROM market_ticks
-                WHERE symbol = $1
-                  AND event_time BETWEEN $2 AND $3
-                ORDER BY event_time ASC, seq ASC
-                LIMIT $4
-                """,
-                symbol,
-                from_time,
-                to_time,
-                limit,
-            )
+        try:
+            async with self._pool.acquire() as conn:
+                rows = await conn.fetch(
+                    """
+                    SELECT
+                        seq,
+                        (EXTRACT(EPOCH FROM event_time) * 1000)::BIGINT AS event_ts,
+                        bid,
+                        ask,
+                        bid_size,
+                        ask_size
+                    FROM market_ticks
+                    WHERE symbol = $1
+                      AND event_time BETWEEN $2 AND $3
+                    ORDER BY event_time ASC, seq ASC
+                    LIMIT $4
+                    """,
+                    symbol,
+                    from_time,
+                    to_time,
+                    limit,
+                )
+        except Exception as exc:
+            if _is_unavailable_error(exc):
+                raise HistoryStoreUnavailableError(
+                    "history database unavailable"
+                ) from exc
+            raise
 
         return [
             {

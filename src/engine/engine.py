@@ -42,6 +42,10 @@ class KafkaConsumerBridge:
         }
         self._queue: asyncio.Queue[ConsumedEvent] = asyncio.Queue(maxsize=10000)
         self._acknowledgements: queue.SimpleQueue[ConsumedEvent] = queue.SimpleQueue()
+        self._pending_acknowledgements: dict[
+            tuple[str, int], dict[int, ConsumedEvent]
+        ] = {}
+        self._next_commit_offsets: dict[tuple[str, int], int] = {}
         self._loop: asyncio.AbstractEventLoop | None = None
         self._thread: threading.Thread | None = None
         self._stop_event = threading.Event()
@@ -88,34 +92,50 @@ class KafkaConsumerBridge:
     def acknowledge(self, consumed: ConsumedEvent) -> None:
         self._acknowledgements.put(consumed)
 
+    def _track_consumed(self, consumed: ConsumedEvent) -> None:
+        key = (consumed.topic, consumed.partition)
+        self._next_commit_offsets.setdefault(key, consumed.offset)
+
     def _drain_acknowledgements(self, consumer, topic_partition_factory) -> None:
         while True:
             try:
                 consumed = self._acknowledgements.get_nowait()
             except queue.Empty:
-                return
+                break
+            key = (consumed.topic, consumed.partition)
+            self._pending_acknowledgements.setdefault(key, {})[
+                consumed.offset
+            ] = consumed
 
-            try:
-                consumer.commit(
-                    offsets=[
-                        topic_partition_factory(
-                            consumed.topic,
-                            consumed.partition,
-                            consumed.offset + 1,
-                        )
-                    ],
-                    asynchronous=False,
-                )
-            except Exception as exc:
-                # Downstream work already succeeded. A failed commit is safe:
-                # Kafka may replay the event and Redis updates are idempotent.
-                logger.warning(
-                    "Failed to commit Kafka offset %s[%d]@%d: %s",
-                    consumed.topic,
-                    consumed.partition,
-                    consumed.offset,
-                    exc,
-                )
+        commit_offsets = []
+        advances: dict[tuple[str, int], tuple[int, int]] = {}
+        for key, pending in self._pending_acknowledgements.items():
+            start = self._next_commit_offsets.get(key)
+            if start is None:
+                continue
+            cursor = start
+            while cursor in pending:
+                cursor += 1
+            if cursor > start:
+                commit_offsets.append(topic_partition_factory(key[0], key[1], cursor))
+                advances[key] = (start, cursor)
+
+        if not commit_offsets:
+            return
+
+        try:
+            consumer.commit(offsets=commit_offsets, asynchronous=False)
+        except Exception as exc:
+            # Downstream work already succeeded. A failed commit is safe:
+            # Kafka may replay the event and Redis updates are idempotent.
+            logger.warning("Failed to commit Kafka acknowledgements: %s", exc)
+            return
+
+        for key, (start, cursor) in advances.items():
+            pending = self._pending_acknowledgements[key]
+            for offset in range(start, cursor):
+                pending.pop(offset, None)
+            self._next_commit_offsets[key] = cursor
 
     def _consume_loop(self):
         from confluent_kafka import Consumer, KafkaError, TopicPartition
@@ -145,6 +165,7 @@ class KafkaConsumerBridge:
                     partition=msg.partition(),
                     offset=msg.offset(),
                 )
+                self._track_consumed(consumed)
                 if not self._handoff(consumed):
                     break
         finally:
