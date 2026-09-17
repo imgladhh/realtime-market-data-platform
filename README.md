@@ -212,15 +212,21 @@ ws://localhost:8000/stream?mode=agg_100ms   # per-client 100ms aggregation
 
 ```
 1.  Client opens WS connection to /stream
-2.  Server creates ClientSession (unique client_id, BoundedQueue, WriterLoop)
+2.  Server creates ClientSession (unique client_id, AggregationBuffer,
+    BoundedQueue, WriterLoop)
 3.  Client sends: {"action": "subscribe", "symbol": "AAPL"}
-4.  Server reads snapshot:AAPL from Redis
-        → snapshot includes seq=N (current sequence number)
-5.  Server sends snapshot to client (type="snapshot", seq=N)
-6.  Server registers client in SubscriptionRegistry[AAPL]
-7.  Fanout loop begins delivering incremental updates (seq > N)
-8.  Client checks each incoming seq:
-        → gap detected (seq jumps by > 5) → re-subscribe for fresh snapshot
+4.  Gateway confirms its Redis Pub/Sub subscription to events:AAPL
+5.  Gateway marks the client/symbol as initializing
+        → Pub/Sub events arriving during initialization are buffered
+6.  Gateway reads snapshot:AAPL from Redis
+        → snapshot includes seq=N (current per-symbol sequence number)
+7.  Gateway enqueues the snapshot and seeds last_seq[AAPL] = N
+8.  Gateway discards buffered events with seq <= N, releases newer events
+    in sequence order, then registers the client in SubscriptionRegistry[AAPL]
+9.  Normal Pub/Sub fanout begins
+        → RAW: stale/duplicate seq is discarded; a missing next seq triggers
+          a Redis snapshot re-fetch
+        → AGG_100MS: forward seq jumps are expected, but stale seq is discarded
 ```
 
 ### Market Event Delivery
@@ -230,15 +236,24 @@ ws://localhost:8000/stream?mode=agg_100ms   # per-client 100ms aggregation
 2.  Produced to Kafka topic market-events, key=AAPL
 3.  Lands in partition determined by hash(AAPL)
 4.  KafkaConsumerBridge polls event in background thread
-5.  Bridges into asyncio event loop via run_coroutine_threadsafe
-6.  AggregationBuffer: passes through (RAW) or buffers (AGG_100MS)
-7.  FanoutDispatcher:
+5.  Bridge hands the event to the asyncio loop via run_coroutine_threadsafe
+6.  DistributionEngine:
         a. Updates Redis: HSET snapshot:AAPL {..., seq=X}
-        b. Looks up SubscriptionRegistry[AAPL] → {session_A, session_B}
-        c. session_A.enqueue(event)  ← non-blocking, O(1)
-        d. session_B.enqueue(event)  ← non-blocking, O(1)
-8.  Each session's WriterLoop independently sends to its WebSocket
+        b. Publishes the event to Redis channel events:AAPL
+        c. Acknowledges the Kafka offset only after both Redis operations succeed
+7.  Every gateway instance with local AAPL demand receives the Pub/Sub event
+8.  Gateway fanout:
+        a. Buffers the event for subscriptions still initializing
+        b. Pushes the event into each active session's AggregationBuffer
+        c. Applies RAW/AGG_100MS sequencing and subscription filters
+        d. Enqueues accepted messages into the per-client BoundedQueue
+9.  Each session's WriterLoop independently sends JSON or msgpack to its WebSocket
 ```
+
+Redis Pub/Sub and bounded client queues provide best-effort live delivery, not
+lossless replay. RAW sequence gaps recover the latest coherent state from the
+Redis snapshot; replaying every missed tick would require a durable replay path
+and client resume offsets.
 
 ---
 
